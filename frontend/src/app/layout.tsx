@@ -106,7 +106,7 @@ export default function RootLayout({
           <VoiceAssistant />
         </TerminalProvider>
         </MotionProvider>
-        <Analytics />
+        {process.env.VERCEL && <Analytics />}
       </body>
     </html>
   );

@@ -494,9 +494,12 @@ export function useVoiceSession(onAction: PageActionRunner) {
       return;
     }
 
-    const socket = new WebSocket(
-      `${credentials.url}?token=${encodeURIComponent(credentials.token)}`,
-    );
+    const rawUrl = `${credentials.url}?token=${encodeURIComponent(credentials.token)}`;
+    const wsUrl =
+      typeof window !== "undefined" && window.location.protocol === "https:"
+        ? rawUrl.replace(/^ws:\/\//i, "wss://")
+        : rawUrl;
+    const socket = new WebSocket(wsUrl);
     socketRef.current = socket;
 
     socket.onmessage = (event) => {
