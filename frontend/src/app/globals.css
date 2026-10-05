@@ -1,0 +1,221 @@
+@import "tailwindcss";
+
+/* ------------------------------------------------------------------ *
+ *  Design tokens — plain monochrome, light + dark.
+ *
+ *  There is no brand hue. Emphasis comes from contrast and weight, not
+ *  color. The only chromatic token is `danger`, and it is functional
+ *  (form errors) rather than decorative.
+ *
+ *  Every utility resolves through `@theme inline`, so the raw custom
+ *  properties below are the single switch: redefine them under a theme
+ *  selector and the whole site follows.
+ * ------------------------------------------------------------------ */
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-edge: var(--edge);
+  --color-edge-strong: var(--edge-strong);
+
+  --color-ink: var(--ink);
+  --color-dim: var(--dim);
+  --color-faint: var(--faint);
+  --color-danger: var(--danger);
+  --color-scrim: var(--scrim);
+
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-display: var(--font-bricolage), var(--font-geist-sans), ui-sans-serif,
+    sans-serif;
+  --font-mono: var(--font-jetbrains-mono), ui-monospace, "SFMono-Regular",
+    "Menlo", monospace;
+}
+
+/* Light — the default, and what an unstyled document should look like. */
+:root {
+  color-scheme: light;
+
+  --bg: #ffffff;
+  --surface: #fafafa;
+  --surface-2: #f1f2f3;
+  --edge: #e4e6e8;
+  --edge-strong: #cbcfd3;
+
+  --ink: #101112;
+  --dim: #55595e;
+  /* 4.8:1 on bg — the lightest grey that still passes AA for small text. */
+  --faint: #6e737a;
+  --danger: #b42318;
+
+  --select: rgba(16, 17, 18, 0.14);
+  --scrim: rgba(0, 0, 0, 0.4);
+  --scroll-thumb: rgba(0, 0, 0, 0.18);
+  --scroll-thumb-hover: rgba(0, 0, 0, 0.3);
+}
+
+/* Dark — applied when the visitor's OS asks for it and they have not
+   explicitly chosen light. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+
+    --bg: #0b0c0d;
+    --surface: #131416;
+    --surface-2: #1b1d20;
+    --edge: #232629;
+    --edge-strong: #383c41;
+
+    --ink: #f0f1f2;
+    --dim: #a2a7ac;
+    --faint: #80858b;
+    --danger: #ff8078;
+
+    --select: rgba(240, 241, 242, 0.18);
+    --scrim: rgba(0, 0, 0, 0.7);
+    --scroll-thumb: rgba(255, 255, 255, 0.16);
+    --scroll-thumb-hover: rgba(255, 255, 255, 0.28);
+  }
+}
+
+/* Dark — explicitly chosen with the toggle, regardless of OS. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #0b0c0d;
+  --surface: #131416;
+  --surface-2: #1b1d20;
+  --edge: #232629;
+  --edge-strong: #383c41;
+
+  --ink: #f0f1f2;
+  --dim: #a2a7ac;
+  --faint: #80858b;
+  --danger: #ff8078;
+
+  --select: rgba(240, 241, 242, 0.18);
+  --scrim: rgba(0, 0, 0, 0.7);
+  --scroll-thumb: rgba(255, 255, 255, 0.16);
+  --scroll-thumb-hover: rgba(255, 255, 255, 0.28);
+}
+
+/* These MUST stay inside `@layer base`. Unlayered CSS outranks every layered
+   rule regardless of specificity, so an unlayered `:focus-visible` would draw
+   a ring straight through `outline-none` (it did — on the terminal's invisible
+   input), and an unlayered `*` would override every `border-*` utility. */
+@layer base {
+  * {
+    border-color: var(--edge);
+  }
+
+  html {
+    scroll-behavior: smooth;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background-color: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* Headings balance their lines; prose avoids a lone word on the last. */
+  h1,
+  h2,
+  h3 {
+    text-wrap: balance;
+  }
+  p,
+  li,
+  dd {
+    text-wrap: pretty;
+  }
+
+  ::selection {
+    background: var(--select);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--ink);
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--scroll-thumb) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: var(--scroll-thumb);
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: var(--scroll-thumb-hover);
+    background-clip: padding-box;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+  }
+}
+
+/* Blinking cursor — the one flourish, and only inside the terminal. */
+.cursor-blink {
+  animation: blink 1.05s steps(1) infinite;
+}
+@keyframes blink {
+  0%,
+  50% {
+    opacity: 1;
+  }
+  50.01%,
+  100% {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cursor-blink {
+    animation: none;
+  }
+}
+
+/* Kaira just brought the visitor here: the section's heading rule redraws in
+   ink. Animations outrank Motion's inline transform, so this wins while it
+   runs and hands back cleanly when the class is removed. */
+.kaira-rule {
+  animation: kaira-rule 3.2s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes kaira-rule {
+  0% {
+    transform: scaleX(0);
+    background-color: var(--ink);
+    height: 2px;
+  }
+  30%,
+  75% {
+    transform: scaleX(1);
+    background-color: var(--ink);
+    height: 2px;
+  }
+  100% {
+    transform: scaleX(1);
+    background-color: var(--edge);
+    height: 1px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .kaira-rule {
+    animation-duration: 0.01s;
+  }
+}

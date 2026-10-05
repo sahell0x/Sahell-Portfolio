@@ -1,0 +1,7410 @@
+import asyncio
+import audioop
+from collections import defaultdict
+from functools import lru_cache
+from datetime import datetime
+import io
+import math
+import os
+import random
+import re
+import traceback
+import time
+import json
+import uuid
+import copy
+import base64
+import pytz
+import websockets
+
+import aiohttp
+from pydub import AudioSegment
+
+from vox.constants import (
+    ACCIDENTAL_INTERRUPTION_PHRASES,
+    DEFAULT_USER_ONLINE_MESSAGE,
+    DEFAULT_USER_ONLINE_MESSAGE_TRIGGER_DURATION,
+    FILLER_DICT,
+    DEFAULT_LANGUAGE_CODE,
+    DEFAULT_TIMEZONE,
+    LANGUAGE_NAMES,
+    LLM_DEFAULT_CONFIGS,
+    NON_EVIDENCE_MARK_TYPES,
+    SWITCH_LANGUAGE_TOOL_DEFINITION,
+    END_CALL_FUNCTION_PREFIX,
+    END_CALL_TOOL_DEFINITION,
+    RESPONSES_API_MODEL_PREFIXES,
+    STALL_HANGUP_FLOOR_S,
+    WEB_BASED_CALL_PROVIDER,
+    WEBCALL_TTS_SAMPLE_RATE,
+)
+from vox.helpers.function_calling_helpers import (
+    trigger_api,
+    computed_api_response,
+    prepare_api_request,
+    validate_outbound_url,
+)
+from vox.helpers.conversation_history import ConversationHistory
+from .base_manager import BaseManager
+from .interruption_manager import InterruptionManager
+from vox.agent_types import *
+from vox.providers import *
+from vox.enums import (
+    TelephonyProvider,
+    LogComponent,
+    LogDirection,
+    HangupReason,
+    NodeType,
+    ChatRole,
+    ToolScope,
+)
+from vox.exceptions import VoxComponentError, LLMError, SynthesizerError, TranscriberError
+from vox.prompts import *
+from vox.helpers.language_detector import LanguageDetector
+from vox.helpers.language_switcher import LanguageSwitcher
+from vox.transcriber.transcriber_pool import TranscriberPool
+from vox.synthesizer.synthesizer_pool import SynthesizerPool
+from vox.helpers.audio_trace import atrace
+from vox.helpers.utils import (
+    structure_system_prompt,
+    compute_function_pre_call_message,
+    select_message_by_language,
+    get_date_time_from_timezone,
+    calculate_audio_duration,
+    create_ws_data_packet,
+    get_file_names_in_directory,
+    get_raw_audio_bytes,
+    is_valid_md5,
+    get_required_input_types,
+    format_messages,
+    get_prompt_responses,
+    resample,
+    save_audio_file_to_s3,
+    update_prompt_with_context,
+    get_md5_hash,
+    static_node_audio_key,
+    clean_json_string,
+    wav_bytes_to_pcm,
+    mp3_bytes_to_pcm,
+    convert_to_request_log,
+    yield_chunks_from_memory,
+    process_task_cancellation,
+    audio_to_mulaw8k,
+    pcm_to_ulaw,
+    format_error_message,
+    enrich_context_with_time_variables,
+)
+from vox.helpers.logger_config import configure_logger
+from ..helpers.mark_event_meta_data import MarkEventMetaData
+from ..helpers.observable_variable import ObservableVariable
+from .models import ComponentLatencies
+from .voicemail_handler import VoicemailHandler
+
+logger = configure_logger(__name__)
+
+
+@lru_cache(maxsize=256)
+def welcome_pcm_upsampled(welcome_b64: str, target_sample_rate: int, source_sample_rate: int = 8000) -> bytes:
+    """Upsample the cached welcome PCM to the raw-PCM output rate (web/freeswitch), memoized
+    per (welcome, rates). The welcome is identical across every call of an agent, so resampling it
+    once — instead of in each TaskManager.__init__ — keeps CPU from spiking when many calls start
+    at once (the welcome burst). Welcomes already at the target rate pass through untouched."""
+    decoded = base64.b64decode(welcome_b64)
+    if source_sample_rate == target_sample_rate:
+        return decoded
+    return resample(
+        decoded,
+        target_sample_rate=target_sample_rate,
+        format="pcm",
+        original_sample_rate=source_sample_rate,
+    )
+
+
+def _inject_end_call_tool(api_tools, *, scope, nodes, description=None):
+    """Add the internal end_call tool (with scope/nodes) to api_tools; no-op if already present."""
+    if api_tools is None:
+        api_tools = {"tools": [], "tools_params": {}}
+    if END_CALL_FUNCTION_PREFIX in api_tools.get("tools_params", {}):
+        return api_tools  # already injected by the experiment path or a prior call
+    tool_def = copy.deepcopy(END_CALL_TOOL_DEFINITION)
+    if description:
+        tool_def["function"]["description"] = description
+    tools_list = api_tools.get("tools", [])
+    if isinstance(tools_list, str):
+        tools_list = json.loads(tools_list)
+    tools_list.append(tool_def)
+    api_tools["tools"] = tools_list
+    api_tools.setdefault("tools_params", {})[END_CALL_FUNCTION_PREFIX] = {
+        "pre_call_message": None,
+        "scope": scope.value if scope else None,
+        "nodes": list(nodes or []),
+    }
+    return api_tools
+
+
+def build_lid_decision_record(
+    *,
+    outcome,
+    fired_at,
+    now,
+    speculate,
+    active_transcript,
+    active,
+    detector_transcript,
+    detector_lang_tag,
+    decision,
+    buffered_max_segment_s,
+    speculation_started,
+    switched_to=None,
+    context_note=None,
+    detector_lang_confidence=None,
+    detector_segments=None,
+    inflight_activity=None,
+):
+    """Build one telemetry record for a Switch-LLM firing (switch / stay / gated).
+
+    Persisted (via task_output → lid_shadow_events.lid_detection_events JSONB) for
+    accuracy/latency metrics. Pure + module-level so the record contract is unit-tested
+    independently of TaskManager. `flow=llm_switch` discriminates these from the legacy
+    heuristic shape that shares the column.
+    """
+    dec = decision or {}
+    return {
+        "flow": "llm_switch",
+        "fired_at": fired_at,
+        "decide_latency_ms": round((now - fired_at) * 1000, 1),
+        "path": "streak" if speculate else ("turn_boundary" if active_transcript else "idle_flush"),
+        "active_language": active,
+        "detector_transcript": detector_transcript,
+        "detector_lang_tag": detector_lang_tag,
+        # Per-segment detections (a turn can span languages); the tag above is just the latest.
+        "detector_lang_confidence": detector_lang_confidence,
+        "detector_segments": detector_segments or [],
+        "active_transcript": active_transcript,
+        # What the caller is speaking, independent of support (set even when staying).
+        "detected_language": dec.get("detected_language"),
+        "detection_confidence": dec.get("detection_confidence"),
+        "target_language": dec.get("target_language"),
+        "target_confidence": dec.get("target_confidence"),
+        "explicit_request": dec.get("explicit_request"),
+        "reasoning": (dec.get("reasoning") or "").strip(),
+        "buffered_max_segment_s": round(buffered_max_segment_s, 3),
+        "speculation_started": speculation_started,
+        "outcome": outcome,
+        "switched_to": switched_to,
+        "context_note_sent": context_note,
+        "context_note_sent_at": now if context_note else None,
+        # Old-language response state when this firing resolved — for a switch, whether
+        "inflight_activity": inflight_activity or {},
+    }
+
+
+# Handoff clips are static per (voice, text): cache across calls so an N-language agent
+# doesn't pay N TTS renders per call, concurrent with the welcome message. Process-wide.
+HANDOFF_CLIP_CACHE: dict = {}
+HANDOFF_CLIP_CACHE_MAX = 256
+
+_NON_NODE_RESPONSE_CATEGORIES = frozenset(
+    {"is_user_online_message", "filler", "backchanneling", "agent_welcome_message", "handoff"}
+)
+
+
+def trailing_utterance_text(segments, gap_seconds=4.0):
+    """Text of the caller's LAST utterance: trailing detector segments in the same
+    language, back to a real silence boundary. Breaks on either a gap > gap_seconds
+    (4s ≈ an utterance boundary, so a request that pauses to think is kept together,
+    unlike a mid-sentence 1.5s) OR a language change (a distinct/stale prior utterance).
+    Subtractive; returns '' so callers fall back to the full transcript."""
+    tail = []
+    prev_start = None
+    tail_lang = None
+    for seg in reversed(segments or []):
+        ts = seg.get("ts")
+        lang = seg.get("lang")
+        # Segments arrive at speech END, so a segment's own start = ts - audio_s.
+        if prev_start is not None:
+            gap_too_big = ts is None or prev_start - ts > gap_seconds
+            lang_changed = bool(tail_lang) and bool(lang) and lang != tail_lang
+            if gap_too_big or lang_changed:
+                break
+        if seg.get("text"):
+            tail.append(seg["text"])
+            tail_lang = tail_lang or lang
+        prev_start = (ts - (seg.get("audio_s") or 0.0)) if ts is not None else None
+    return " ".join(reversed(tail)).strip()
+
+
+class TaskManager(BaseManager):
+    def __init__(
+        self,
+        assistant_name,
+        task_id,
+        task,
+        ws,
+        input_parameters=None,
+        context_data=None,
+        assistant_id=None,
+        turn_based_conversation=False,
+        cache=None,
+        input_queue=None,
+        conversation_history=None,
+        output_queue=None,
+        yield_chunks=True,
+        **kwargs,
+    ):
+        super().__init__()
+        self.kwargs = kwargs
+        self.kwargs["task_manager_instance"] = self
+        # Optional load-signal callback (set by the caller only for PTU-served calls).
+        self.on_turn_usage = kwargs.get("on_turn_usage")
+        self._usage_tasks = set()  # strong refs so fire-and-forget tallies aren't GC'd before they run
+        # Optional per-provider health callback (circuit-breaker shadow); never affects the call.
+        self.on_provider_health = kwargs.get("on_provider_health")
+        self._cb_tasks = set()
+        self._cb_transcriber_connect_reported = False
+        self._cb_synthesizer_connect_reported = False
+        self._cb_stream_reported = False
+        self._cb_tts_last = None
+
+        self.conversation_start_init_ts = time.time() * 1000
+        self.llm_latencies = ComponentLatencies()
+        self.transcriber_latencies = ComponentLatencies()
+        self.synthesizer_latencies = ComponentLatencies()
+        self.rag_latencies = {"turn_latencies": []}
+        self.routing_latencies = {"turn_latencies": []}
+        self.stream_sid_ts = None
+        self.welcome_message_duration_ms = None
+        self.transcriber_error_events: list[dict] = []
+        self.blocked_audio_events: list[dict] = []
+        self._blocked_sequences: set = set()  # dedup: only record first block per sequence
+        self._sent_audio_sequences: set = set()
+        self._committed_assistant_sequences: set = set()
+
+        self.task_config = task
+
+        self.timezone = pytz.timezone(DEFAULT_TIMEZONE)
+        self.language = DEFAULT_LANGUAGE_CODE
+        self.synthesizer_voice_id = None
+        self.synthesizer_model = None
+        self.transfer_call_params = self.kwargs.get("transfer_call_params", None)
+
+        if task["tools_config"].get("api_tools", None) is not None:
+            self.kwargs["api_tools"] = task["tools_config"]["api_tools"]
+
+        if (
+            task["tools_config"]["llm_agent"]
+            and task["tools_config"]["llm_agent"]["llm_config"].get("assistant_id", None) is not None
+        ):
+            self.kwargs["assistant_id"] = task["tools_config"]["llm_agent"]["llm_config"]["assistant_id"]
+
+        logger.info(f"doing task {task}")
+        self.task_id = task_id
+        self.assistant_name = assistant_name
+        self.tools = {}
+        self.multilingual_prompts = {}
+        self.websocket = ws
+        self.context_data = context_data
+        self.turn_based_conversation = turn_based_conversation
+        self.enforce_streaming = kwargs.get("enforce_streaming", False)
+        self.room_url = kwargs.get("room_url", None)
+        self.is_web_based_call = kwargs.get("is_web_based_call", False)
+        # self.callee_silent = True
+        # TODO check if we need to toggle this based on some config
+        self.yield_chunks = False
+        # Set up communication queues between processes
+        self.audio_queue = asyncio.Queue()
+        self.llm_queue = asyncio.Queue()
+        self.synthesizer_queue = asyncio.Queue()
+        self.transcriber_output_queue = asyncio.Queue()
+        self.dtmf_queue = asyncio.Queue()
+        self.event_queue = kwargs.get("event_queue") or asyncio.Queue()
+        self.queues = {
+            "dtmf": self.dtmf_queue,
+            "events": self.event_queue,
+            "transcriber": self.audio_queue,
+            "llm": self.llm_queue,
+            "synthesizer": self.synthesizer_queue,
+        }
+        self.pipelines = task["toolchain"]["pipelines"]
+        self.textual_chat_agent = False
+        if (
+            task["toolchain"]["pipelines"][0] == "llm"
+            and task["tools_config"]["llm_agent"]["agent_task"] == "conversation"
+        ):
+            self.textual_chat_agent = False
+
+        # Assistant persistance stuff
+        self.assistant_id = assistant_id
+        self.run_id = kwargs.get("run_id")
+
+        self.mark_event_meta_data = MarkEventMetaData()
+        self.sampling_rate = 24000
+        self.conversation_ended = False
+        self.has_transfer = False
+        self.hangup_triggered = False
+        self.hangup_triggered_at = None
+        self.hangup_decision_at = None
+        self._hangup_processing = False
+        self.dtmf_events: list[dict] = []
+        self.non_fatal_llm_error_events: list[dict] = []
+        self._agent_end_timestamps: dict = {}
+        self.hangup_message_queued = False
+        self._end_of_conversation_in_progress = False
+        self._end_call_in_progress = False
+        self._turn_audio_flushed = asyncio.Event()
+        self._turn_audio_flushed.set()
+        self.hangup_mark_event_timeout = 10
+
+        # Prompts
+        self.prompts, self.system_prompt = {}, {}
+        self.input_parameters = input_parameters
+
+        # Recording
+        self.should_record = False
+        self.conversation_recording = {
+            "input": {"data": b"", "started": time.time()},
+            "output": [],
+            "metadata": {"started": 0},
+        }
+
+        self.welcome_message_audio = self.kwargs.pop("welcome_message_audio", None)
+        # Rate the backend synthesized the welcome at: 8000 for telephony (unchanged legacy
+        # payloads too), 24000 for web calls so the first turn matches the full-band TTS.
+        self.welcome_message_audio_sample_rate = int(self.kwargs.pop("welcome_message_audio_sample_rate", None) or 8000)
+
+        self.welcome_message_delay = task.get("task_config", {}).get("welcome_message_delay", 0)
+        # Pre-decode welcome audio for faster playback
+        self.preloaded_welcome_audio = (
+            base64.b64decode(self.welcome_message_audio) if self.welcome_message_audio else None
+        )
+        # Cached welcome PCM may be below the raw-PCM output rate (web/freeswitch play at 24kHz), so
+        # upsample or the first audio is pitched; already-24kHz welcomes pass through. Memoized per
+        # welcome (welcome_pcm_upsampled) so this resample runs once, not in every call's __init__ —
+        # otherwise a burst of concurrent calls spikes CPU on the event loop.
+        is_freeswitch_output = (task.get("tools_config", {}).get("output") or {}).get(
+            "provider"
+        ) == TelephonyProvider.FREESWITCH.value
+        if (
+            (self.is_web_based_call or is_freeswitch_output)
+            and self.preloaded_welcome_audio
+            and self.welcome_message_audio_sample_rate != WEBCALL_TTS_SAMPLE_RATE
+        ):
+            self.preloaded_welcome_audio = welcome_pcm_upsampled(
+                self.welcome_message_audio, WEBCALL_TTS_SAMPLE_RATE, self.welcome_message_audio_sample_rate
+            )
+        self.observable_variables = {}
+        self.output_handler_set = False
+        # IO HANDLERS
+        if task_id == 0:
+            # A web call always rides the default socket handlers, whatever the
+            # stored agent config says — a browser has no telephony leg.
+            if self.is_web_based_call:
+                for _direction in ("input", "output"):
+                    self.task_config["tools_config"][_direction]["provider"] = "default"
+
+            self.default_io = self.task_config["tools_config"]["output"]["provider"] == "default"
+            self.observable_variables["agent_hangup_observable"] = ObservableVariable(False)
+            self.observable_variables["agent_hangup_observable"].add_observer(self.agent_hangup_observer)
+
+            self.observable_variables["final_chunk_played_observable"] = ObservableVariable(False)
+            self.observable_variables["final_chunk_played_observable"].add_observer(self.final_chunk_played_observer)
+
+            if self.is_web_based_call:
+                self.observable_variables["init_event_observable"] = ObservableVariable(None)
+                self.observable_variables["init_event_observable"].add_observer(self.handle_init_event)
+
+            # TODO revert this temporary change for web based call
+            if self.is_web_based_call:
+                self.should_record = False
+            else:
+                self.should_record = (
+                    self.task_config["tools_config"]["output"]["provider"] == "default" and self.enforce_streaming
+                )  # In this case, this is a websocket connection and we should record
+
+            self.__setup_input_handlers(turn_based_conversation, input_queue, self.should_record)
+        self.__setup_output_handlers(turn_based_conversation, output_queue)
+
+        self.first_message_task_new = asyncio.create_task(self.message_task_new())
+
+        self.conversation_history = ConversationHistory(conversation_history)
+        self.label_flow = []
+
+        # Setup IO SERVICE, TRANSCRIBER, LLM, SYNTHESIZER
+        self.llm_task = None
+        self.eager_llm_task = None
+        self.eager_history_snapshot = None
+        self.eager_meta_info = None
+        self.llm_queue_task = None
+        self.typed_input_task = None
+        self.execute_function_call_task = None
+        # Set while a tool call executes so a parallel LID switch won't truncate it.
+        self.function_call_in_flight = False
+        self.synthesizer_tasks = []
+        self.synthesizer_task = None
+        self._component_error = None
+        self._error_logged = False
+        self.synthesizer_monitor_task = None
+        self.dtmf_task = None
+        self.event_listener_task = None
+
+        # state of conversation
+        self.current_request_id = None
+        self.previous_request_id = None
+        self.llm_rejected_request_ids = set()
+        self.llm_processed_request_ids = set()
+        self.buffers = []
+        self.should_respond = False
+        self.last_response_time = time.time()
+        self.consider_next_transcript_after = time.time()
+        self.llm_response_generated = False
+        self.response_in_pipeline = False
+        self._response_turn_id = 0
+        self._turn_msg_map = {}  # turn_id → assistant message dict ref in _messages
+        self._pending_assistant_history = {}  # sequence_id -> {content, turn_id, response_uid}
+
+        # Language detection
+        self.language_detector = LanguageDetector(self.task_config["task_config"], run_id=self.run_id)
+        self.language_injection_mode = self.task_config["task_config"].get("language_injection_mode")
+        self.language_instruction_template = self.task_config["task_config"].get("language_instruction_template")
+
+        # Call conversations
+        self.call_sid = None
+        self.stream_sid = None
+
+        # metering
+        self.transcriber_duration = 0
+        self.synthesizer_characters = 0
+        self.ended_by_assistant = False
+        self.start_time = time.time()
+
+        # Tasks
+        self.extracted_data = None
+        self.summarized_data = None
+        self.stream = (
+            self.task_config["tools_config"]["synthesizer"] is not None
+            and self.task_config["tools_config"]["synthesizer"]["stream"]
+        ) and (self.enforce_streaming or not self.turn_based_conversation)
+
+        self.is_local = False
+        self.llm_config = None
+        self.agent_type = None
+
+        self.llm_config_map = {}
+        self.llm_agent_map = {}
+        if self.__is_multiagent():
+            for agent, config in self.task_config["tools_config"]["llm_agent"]["llm_config"]["agent_map"].items():
+                self.llm_config_map[agent] = config.copy()
+                self.llm_config_map[agent]["buffer_size"] = self.task_config["tools_config"]["synthesizer"][
+                    "buffer_size"
+                ]
+        else:
+            if self.task_config["tools_config"]["llm_agent"] is not None:
+                if self.__is_knowledgebase_agent():
+                    self.llm_agent_config = self.task_config["tools_config"]["llm_agent"]
+                    self.llm_config = {
+                        "model": self.llm_agent_config["llm_config"]["model"],
+                        "max_tokens": self.llm_agent_config["llm_config"]["max_tokens"],
+                        "provider": self.llm_agent_config["llm_config"]["provider"],
+                        "buffer_size": self.task_config["tools_config"]["synthesizer"].get("buffer_size"),
+                        "temperature": self.llm_agent_config["llm_config"]["temperature"],
+                    }
+                elif self.__is_graph_agent():
+                    self.llm_agent_config = self.task_config["tools_config"]["llm_agent"]
+                    self.llm_config = {
+                        "model": self.llm_agent_config["llm_config"]["model"],
+                        "max_tokens": self.llm_agent_config["llm_config"]["max_tokens"],
+                        "provider": self.llm_agent_config["llm_config"]["provider"],
+                        "buffer_size": self.task_config["tools_config"]["synthesizer"].get("buffer_size"),
+                        "temperature": self.llm_agent_config["llm_config"]["temperature"],
+                    }
+                else:
+                    agent_type = self.task_config["tools_config"]["llm_agent"].get("agent_type", None)
+                    if not agent_type:
+                        self.llm_agent_config = self.task_config["tools_config"]["llm_agent"]
+                    else:
+                        self.llm_agent_config = self.task_config["tools_config"]["llm_agent"]["llm_config"]
+
+                    self.llm_config = {
+                        "model": self.llm_agent_config["model"],
+                        "max_tokens": self.llm_agent_config["max_tokens"],
+                        "provider": self.llm_agent_config["provider"],
+                        "temperature": self.llm_agent_config["temperature"],
+                    }
+
+                if "reasoning_effort" in self.llm_agent_config:
+                    self.llm_config["reasoning_effort"] = self.llm_agent_config["reasoning_effort"]
+
+                if "reasoning_summary" in self.llm_agent_config:
+                    self.llm_config["reasoning_summary"] = self.llm_agent_config["reasoning_summary"]
+
+                if "thinking_budget" in self.llm_agent_config:
+                    self.llm_config["thinking_budget"] = self.llm_agent_config["thinking_budget"]
+
+                if self.llm_agent_config.get("use_responses_api") or any(
+                    p in self.llm_config.get("model", "") for p in RESPONSES_API_MODEL_PREFIXES
+                ):
+                    self.llm_config["use_responses_api"] = True
+
+                if self.llm_agent_config.get("compact_threshold"):
+                    self.llm_config["compact_threshold"] = self.llm_agent_config["compact_threshold"]
+
+        # Output stuff
+        self.output_task = None
+        self.buffered_output_queue = asyncio.Queue()
+
+        # Memory
+        self.cache = cache
+
+        # Initialize InterruptionManager with defaults (will be reconfigured for task_id == 0)
+        self.interruption_manager = InterruptionManager()
+
+        # setup request logs
+        self.request_logs = []
+
+        # Stores structured API call records for dashboard/backend persistence.
+        self.function_tool_api_call_details = []
+        # Records every language switch — manual tool call (legacy) or LLM-driven
+        # (triggered_by="lid_llm") — used post-call for precision / latency analysis.
+        self.language_switch_events: list[dict] = []
+        # Legacy-flow handoff state (populated by __inject_switch_language_tool
+        # when the LLM-driven switch flow is NOT enabled for this call).
+        self.switch_handoff_messages = {}
+        self.agent_names = {}
+        # Dedicated LLM that decides language switches from the unbiased detector
+        # transcript. Set up in __setup_transcriber only for gated multilingual agents.
+        self.language_switcher = None
+        # Serializes switch decisions so overlapping turns can't interleave two
+        # switch+follow-up sequences. Background-only: the caller-facing pipeline
+        # (ASR -> main LLM -> TTS) never waits on this lock.
+        self.language_switch_lock = asyncio.Lock()
+        # Copy of the most recent turn's meta_info — template for the idle-flush
+        # fallback's follow-up generation, where no main turn (and thus no meta_info)
+        # exists because the locked ASR couldn't decode the caller's speech.
+        self._last_turn_meta_info = None
+        self._lid_idle_watcher_task = None
+        # Handoff clips pre-rendered per language on that language's OWN voice (text and
+        self.handoff_audio_cache = {}
+        self.handoff_prewarm_task = None
+        # Mid-speech silent switch state: set when a streak-fired switch lands while
+        # the caller is STILL speaking (reply suppressed). The next main turn swaps
+        # its ASR text for the full unbiased transcript (prefix + drained detector
+        # buffer); a 2s fallback replies if no turn arrives (caller stopped at the
+        # switch boundary).
+        self._pending_switch_turn = None
+        self._post_switch_fallback_task = None
+        # In-flight speculative follow-up generation (streak-fire switches only);
+        # single slot is safe because decisions are serialized by language_switch_lock.
+        self._spec_followup_task = None
+        self.transfer_call_events: list[dict] = []
+        self.hangup_task = None
+
+        self.conversation_config = None
+
+        if task_id == 0:
+            provider_config = self.task_config["tools_config"]["synthesizer"].get("provider_config")
+            self.synthesizer_voice = provider_config["voice"]
+            self.hangup_detail = None
+            self.end_call_primary = False  # set below if task_config opts in
+
+            self.handle_accumulated_message_task = None
+            # self.initial_silence_task = None
+            self.hangup_task = None
+            self.transcriber_task = None
+            self.output_chunk_size = 16384 if self.sampling_rate == 24000 else 4096  # 0.5 second chunk size for calls
+            # For nitro
+            self.nitro = True
+            self.conversation_config = task.get("task_config", {})
+            logger.info(f"Conversation config {self.conversation_config}")
+
+            # Enable DTMF flow
+            dtmf_enabled = self.conversation_config.get("dtmf_enabled", False)
+            if dtmf_enabled:
+                self.tools["input"].is_dtmf_active = True
+                self.dtmf_task = asyncio.create_task(self.inject_digits_to_conversation())
+
+            self.trigger_user_online_message_after = self.conversation_config.get(
+                "trigger_user_online_message_after", DEFAULT_USER_ONLINE_MESSAGE_TRIGGER_DURATION
+            )
+            self.check_if_user_online = self.conversation_config.get("check_if_user_online", True)
+            self.check_user_online_message_config = self.conversation_config.get(
+                "check_user_online_message", DEFAULT_USER_ONLINE_MESSAGE
+            )
+            if self.check_user_online_message_config and self.context_data:
+                if isinstance(self.check_user_online_message_config, dict):
+                    self.check_user_online_message_config = {
+                        lang: update_prompt_with_context(msg, self.context_data)
+                        for lang, msg in self.check_user_online_message_config.items()
+                    }
+                else:
+                    self.check_user_online_message_config = update_prompt_with_context(
+                        self.check_user_online_message_config, self.context_data
+                    )
+
+            self.kwargs["process_interim_results"] = (
+                "true" if self.conversation_config.get("optimize_latency", False) is True else "false"
+            )
+
+            # for long pauses and rushing
+            if self.conversation_config is not None:
+                # TODO need to get this for azure - for azure the subtraction would not happen
+                self.minimum_wait_duration = self.task_config["tools_config"]["transcriber"]["endpointing"]
+                self.last_spoken_timestamp = time.time() * 1000
+                self.incremental_delay = self.conversation_config.get("incremental_delay", 100)
+
+                # Cut conversation
+                self.hang_conversation_after = self.conversation_config.get("hangup_after_silence", 10)
+                self.last_transmitted_timestamp = 0
+
+                self.use_fillers = self.conversation_config.get("use_fillers", False)
+                self.use_llm_to_determine_hangup = self.conversation_config.get("hangup_after_LLMCall", False)
+                self.check_for_completion_prompt = None
+                if self.use_llm_to_determine_hangup:
+                    self.check_for_completion_prompt = self.conversation_config.get("call_cancellation_prompt", None)
+                    if not self.check_for_completion_prompt:
+                        self.check_for_completion_prompt = CHECK_FOR_COMPLETION_PROMPT
+                    self.check_for_completion_prompt += """
+                        Respond only in this JSON format:
+                            {{
+                              "hangup": "Yes" or "No"
+                            }}
+                    """
+
+                self.call_hangup_message_config = self.conversation_config.get("call_hangup_message", None)
+                if self.call_hangup_message_config and self.context_data and not self.is_web_based_call:
+                    if isinstance(self.call_hangup_message_config, dict):
+                        self.call_hangup_message_config = {
+                            lang: update_prompt_with_context(msg, self.context_data)
+                            for lang, msg in self.call_hangup_message_config.items()
+                        }
+                    else:
+                        self.call_hangup_message_config = update_prompt_with_context(
+                            self.call_hangup_message_config, self.context_data
+                        )
+                self.check_for_completion_llm = os.getenv("CHECK_FOR_COMPLETION_LLM")
+
+                cancellation_prompt = self.conversation_config.get("call_cancellation_prompt")
+                end_call_description = (
+                    (
+                        f"End the current call. Always say your goodbye message before calling this function.\n"
+                        f"Criteria for when to end: {cancellation_prompt}"
+                    )
+                    if cancellation_prompt
+                    else None
+                )
+
+                self.end_call_primary = (
+                    self.conversation_config.get("end_call_tool_mode") in ("primary", "primary_with_shadow_hangup")
+                    and self.use_llm_to_determine_hangup
+                    and cancellation_prompt
+                )
+                if self.end_call_primary:
+                    self.kwargs["api_tools"] = _inject_end_call_tool(
+                        self.kwargs.get("api_tools"),
+                        scope=ToolScope.GLOBAL,
+                        nodes=[],
+                        description=end_call_description,
+                    )
+                    logger.info("end_call tool active as primary hangup")
+                elif self.__is_graph_agent():
+                    # a node opting in via function_call="end_call" needs the tool regardless of the hangup toggle
+                    llm_config = self.task_config["tools_config"]["llm_agent"].get("llm_config", {}) or {}
+                    end_call_nodes = [
+                        n.get("id")
+                        for n in (llm_config.get("nodes") or [])
+                        if n.get("function_call") == END_CALL_FUNCTION_PREFIX and n.get("id")
+                    ]
+                    if end_call_nodes:
+                        self.kwargs["api_tools"] = _inject_end_call_tool(
+                            self.kwargs.get("api_tools"),
+                            scope=ToolScope.NODE,
+                            nodes=end_call_nodes,
+                            description=end_call_description,
+                        )
+                        logger.info(f"end_call tool injected node-scoped on nodes={end_call_nodes}")
+
+                # Voicemail detection (time-based)
+                output_tool_available = (
+                    "output" in self.tools
+                    and self.tools["output"]
+                    and self.tools["output"].requires_custom_voicemail_detection()
+                )
+                self.voicemail_handler = VoicemailHandler(self, self.conversation_config, output_tool_available)
+
+                self.time_since_last_spoken_human_word = 0
+
+                self.repeat_after_silence_seconds = None
+
+                # Handling accidental interruption
+                self.number_of_words_for_interruption = self.conversation_config.get(
+                    "number_of_words_for_interruption", 3
+                )
+                self.asked_if_user_is_still_there = False  # Used to make sure that if user's phrase qualifies as acciedental interruption, we don't break the conversation loop
+                self.started_transmitting_audio = False
+                self.accidental_interruption_phrases = set(ACCIDENTAL_INTERRUPTION_PHRASES)
+                # self.interruption_backoff_period = 1000 #conversation_config.get("interruption_backoff_period", 300) #this is the amount of time output loop will sleep before sending next audio
+                self.allow_extra_sleep = False  # It'll help us to back off as soon as we hear interruption for a while
+
+                # Initialize InterruptionManager to centralize interruption logic
+                self.interruption_manager = InterruptionManager(
+                    number_of_words_for_interruption=self.number_of_words_for_interruption,
+                    accidental_interruption_phrases=ACCIDENTAL_INTERRUPTION_PHRASES,
+                    incremental_delay=self.incremental_delay,
+                    minimum_wait_duration=self.minimum_wait_duration,
+                )
+
+                # Backchanneling
+                self.should_backchannel = self.conversation_config.get("backchanneling", False)
+                self.backchanneling_task = None
+                self.backchanneling_start_delay = self.conversation_config.get("backchanneling_start_delay", 5)
+                self.backchanneling_message_gap = self.conversation_config.get(
+                    "backchanneling_message_gap", 2
+                )  # Amount of duration co routine will sleep
+                if self.should_backchannel and not turn_based_conversation and task_id == 0:
+                    logger.info(f"Should backchannel")
+                    self.backchanneling_audios = f"{kwargs.get('backchanneling_audio_location', os.getenv('BACKCHANNELING_PRESETS_DIR'))}/{self.synthesizer_voice.lower()}"
+                    # self.num_files = list_number_of_wav_files_in_directory(self.backchanneling_audios)
+                    try:
+                        self.filenames = get_file_names_in_directory(self.backchanneling_audios)
+                        logger.info(f"Backchanneling audio location {self.backchanneling_audios}")
+                    except Exception as e:
+                        logger.error(f"Something went wrong an putting should backchannel to false {e}")
+                        self.should_backchannel = False
+                else:
+                    self.backchanneling_audio_map = []
+                # Agent welcome message
+                if "agent_welcome_message" in self.kwargs:
+                    logger.info(f"Agent welcome message: {self.kwargs['agent_welcome_message']}")
+                    self.first_message_task = None
+                    self.transcriber_message = ""
+
+                # Discard pre-welcome utterance
+                self.discard_pre_welcome_utterance = self.conversation_config.get(
+                    "discard_pre_welcome_utterance", False
+                )
+                self._speech_started_before_welcome = False
+
+        # setting transcriber and synthesizer in parallel
+        self.__setup_transcriber()
+        self.__setup_synthesizer(self.llm_config)
+        if not self.turn_based_conversation and task_id == 0:
+            self.synthesizer_monitor_task = asyncio.create_task(self.tools["synthesizer"].monitor_connection())
+
+        # Language switching, gated per call by the LANGUAGE_SWITCH feature flag
+        # (tools_config["llm_language_switch"], see __language_switch_enabled):
+        #   enabled  → dedicated Switch LLM driven by the unbiased Saaras v3
+        #              detector (handle_language_switch); the main LLM carries
+        #              no switch tool.
+        #   disabled → legacy flow: switch_language tool on the main LLM + the
+        #              pool's per-segment LID heuristic (master behavior).
+        # Handoff messages are consumed by BOTH flows (legacy: before the tool
+        # switch; new: played to cover the switch → follow-up generation gap).
+        self.switch_handoff_messages = self.task_config.get("tools_config", {}).get("switch_handoff_messages") or {}
+        self.agent_names = self.task_config.get("tools_config", {}).get("agent_names") or {}
+        # Injected for BOTH flows — in the LLM-driven flow it's the fast path for explicit requests.
+        self.__inject_switch_language_tool()
+
+        # # setting llm
+        # llm = self.__setup_llm(self.llm_config)
+        # # Setup tasks
+        # self.__setup_tasks(llm)
+
+        # setting llm
+        if self.llm_config is not None:
+            llm = self.__setup_llm(self.llm_config, task_id)
+            # Setup tasks
+            agent_params = {"llm": llm, "agent_type": self.llm_agent_config.get("agent_type", "simple_llm_agent")}
+            self.__setup_tasks(**agent_params)
+
+        elif self.__is_multiagent():
+            # Setup task for multiagent conversation
+            for agent in self.task_config["tools_config"]["llm_agent"]["llm_config"]["agent_map"]:
+                if "routes" in self.llm_config_map[agent]:
+                    del self.llm_config_map[agent]["routes"]  # Remove routes from here as it'll create conflict ahead
+                llm = self.__setup_llm(self.llm_config_map[agent])
+                agent_type = self.llm_config_map[agent].get("agent_type", "simple_llm_agent")
+                logger.info(f"Getting response for {llm} and agent type {agent_type} and {agent}")
+                agent_params = {"llm": llm, "agent_type": agent_type}
+                llm_agent = self.__setup_tasks(**agent_params)
+                self.llm_agent_map[agent] = llm_agent
+
+        elif self.task_config["task_type"] == "webhook":
+            if "webhookURL" in self.task_config["tools_config"]["api_tools"]:
+                webhook_url = self.task_config["tools_config"]["api_tools"]["webhookURL"]
+            else:
+                webhook_url = self.task_config["tools_config"]["api_tools"]["tools_params"]["webhook"]["url"]
+            logger.info(f"Webhook URL {webhook_url}")
+            self.tools["webhook_agent"] = WebhookAgent(webhook_url=webhook_url)
+
+    @staticmethod
+    def _sanitize_api_call_headers(headers):
+        if not isinstance(headers, dict):
+            return headers
+
+        redacted_headers = {}
+        sensitive_keys = {"authorization", "proxy-authorization", "x-api-key", "api-key"}
+        for key, value in headers.items():
+            if str(key).lower() in sensitive_keys:
+                redacted_headers[key] = "<redacted>"
+            else:
+                redacted_headers[key] = value
+        return redacted_headers
+
+    def _stamp_llm_latency_dict(
+        self,
+        latency_dict: dict,
+        meta_info: dict,
+        actual_input_tokens,
+        actual_output_tokens,
+        actual_reasoning_tokens,
+        actual_cached_tokens,
+        response_text: str | None = None,
+    ) -> None:
+        """Stamp observability fields onto an LLM turn latency dict.
+
+        Called from both the function-call and regular-text branches of
+        __do_llm_generation so the two paths stay in sync automatically.
+        """
+        latency_dict["turn_id"] = meta_info.get("turn_id")
+        latency_dict["llm_start_ms"] = (
+            round(meta_info.get("llm_start_time", 0) * 1000 - self.conversation_start_init_ts, 2)
+            if meta_info.get("llm_start_time")
+            else None
+        )
+        _t = self.tools.get("transcriber")
+        if hasattr(_t, "transcribers") and hasattr(_t, "active_label"):
+            _t = _t.transcribers.get(_t.active_label, _t)
+        latency_dict["asr_turn_id"] = getattr(_t, "turn_counter", None)
+        latency_dict["model"] = self.llm_config.get("model") if self.llm_config else None
+        latency_dict["input_tokens"] = actual_input_tokens
+        latency_dict["output_tokens"] = actual_output_tokens
+        latency_dict["reasoning_tokens"] = actual_reasoning_tokens
+        latency_dict["cached_tokens"] = actual_cached_tokens
+        if response_text:
+            latency_dict["response_text"] = response_text.strip()
+
+    @staticmethod
+    def _extract_api_call_runtime_args(resp):
+        excluded_keys = {"model_response", "textual_response"}
+        return {key: copy.deepcopy(value) for key, value in resp.items() if key not in excluded_keys}
+
+    def _build_call_context(self):
+        """Common call-state fields included in the pre-call webhook payload.
+
+        These mirror the identifiers carried by the platform's customer-facing
+        call-state event webhooks (execution_id/agent_id/provider/numbers) — NOT the
+        transfer-specific or internal fields (call_sid/stream_sid are excluded there).
+        """
+        recipient_data = (self.context_data or {}).get("recipient_data") or {}
+        return {
+            "execution_id": self.run_id,
+            "agent_id": self.assistant_id,
+            "provider": self.tools["input"].io_provider,
+            "from_number": recipient_data.get("from_number"),
+            "to_number": recipient_data.get("to_number"),
+        }
+
+    def fire_pre_call_webhook(self, webhook_url, called_fun, resp, meta_info, webhook_param=None):
+        """Fire-and-forget pre-call webhook before the tool's main request runs.
+
+        ``params`` = the ``pre_call_webhook_param`` template substituted with the LLM args
+        (else empty). Two delivery modes:
+          * If ``PRE_CALL_WEBHOOK_DISPATCH_URL`` is set, POST {execution_id, webhook_url,
+            params} to it; the backend enriches with the full execution record + params and
+            forwards to the customer's webhook_url.
+          * Otherwise (fallback), POST directly to the customer's webhook_url with
+            params + the common call-state fields.
+        Never blocks or fails the main tool call: background task, errors swallowed.
+        """
+        excluded = {"model_response", "textual_response", "tool_call_id", "resp"}
+        llm_args = {key: copy.deepcopy(value) for key, value in resp.items() if key not in excluded}
+
+        # Default missing %(name)s placeholders to "" so one absent field doesn't crash the
+        # whole substitution and wipe the payload.
+        params = {}
+        if webhook_param:
+            template_str = webhook_param if isinstance(webhook_param, str) else json.dumps(webhook_param)
+            substitution_args = {name: "" for name in re.findall(r"%\((\w+)\)s", template_str)}
+            substitution_args.update(llm_args)
+            try:
+                prepared = prepare_api_request(webhook_param, None, None, **substitution_args)
+                if prepared.get("api_params") is not None:
+                    params = prepared["api_params"]
+            except Exception as exc:
+                logger.warning(f"pre_call_webhook_param substitution failed: {exc}")
+
+        dispatch_url = os.getenv("PRE_CALL_WEBHOOK_DISPATCH_URL")
+        if dispatch_url:
+            # Backend dispatch: it fetches the execution record and merges params.
+            target_url = dispatch_url
+            payload = {"execution_id": self.run_id, "webhook_url": webhook_url, "params": params}
+        else:
+            # Fallback: post directly to the customer URL with params + common call-state fields.
+            target_url = webhook_url
+            payload = {**params, **self._build_call_context()}
+
+        # Record in function_tool_api_call_details so the pre-call webhook lands in the
+        # same per-call S3 record as the other API/tool calls.
+        api_call_detail = self._start_api_call_detail(
+            called_fun=f"{called_fun}:pre_call_webhook",
+            url=target_url,
+            method="POST",
+            param=None,
+            headers={"Content-Type": "application/json"},
+            meta_info=meta_info,
+            runtime_args={"tool_call_id": resp.get("tool_call_id", "")},
+            request_body=json.dumps(payload),
+            api_params=payload,
+        )
+
+        async def send():
+            try:
+                # ``target_url`` is user-controlled only on the direct fallback path;
+                # the dispatch URL is operator-set env config and may be internal.
+                if not dispatch_url:
+                    await validate_outbound_url(target_url)
+                convert_to_request_log(
+                    str(payload),
+                    meta_info,
+                    None,
+                    LogComponent.FUNCTION_CALL,
+                    direction=LogDirection.REQUEST,
+                    run_id=self.run_id,
+                )
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                    # allow_redirects=False: a redirect hop is not re-validated and would
+                    # reopen the SSRF path past the pre-flight check above.
+                    async with session.post(target_url, json=payload, allow_redirects=False) as response:
+                        response_text = await response.text()
+                        logger.info(f"pre_call_webhook response ({response.status}): {response_text}")
+                        convert_to_request_log(
+                            str(response_text),
+                            meta_info,
+                            None,
+                            LogComponent.FUNCTION_CALL,
+                            direction=LogDirection.RESPONSE,
+                            run_id=self.run_id,
+                        )
+                        self._finalize_api_call_detail(
+                            api_call_detail,
+                            response=response_text,
+                            status_code=response.status,
+                            content_type=response.headers.get("Content-Type"),
+                        )
+            except Exception as exc:
+                logger.warning(f"pre_call_webhook to {target_url} failed (ignored): {exc}")
+                self._finalize_api_call_detail(api_call_detail, error=exc)
+
+        # Keep a strong reference so the task isn't garbage-collected before the POST
+        # finishes (the loop only holds a weak ref); drop it once done. Lazy-init the set
+        # so this never depends on __init__ (robust to merge churn).
+        if not hasattr(self, "background_tasks"):
+            self.background_tasks = set()
+        task = asyncio.create_task(send())
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
+
+    def _start_api_call_detail(
+        self,
+        *,
+        called_fun,
+        url,
+        method,
+        param,
+        headers,
+        meta_info,
+        runtime_args,
+        request_body=None,
+        api_params=None,
+    ):
+        api_call_detail = {
+            "tool_name": called_fun,
+            "tool_call_id": runtime_args.get("tool_call_id", ""),
+            "url": url,
+            "method": method.upper() if isinstance(method, str) else method,
+            "request_template": copy.deepcopy(param),
+            "request_body": copy.deepcopy(request_body),
+            "request_params": copy.deepcopy(api_params if api_params is not None else runtime_args),
+            "runtime_args": copy.deepcopy(runtime_args),
+            "headers": self._sanitize_api_call_headers(copy.deepcopy(headers)),
+            "meta": {
+                "request_id": meta_info.get("request_id"),
+                "sequence_id": meta_info.get("sequence_id"),
+                "turn_id": meta_info.get("turn_id"),
+            },
+            "started_at": datetime.now().isoformat(),
+            "status": "pending",
+            "response_status_code": None,
+            "response_content_type": None,
+            "response_body": None,
+            "response_json": None,
+        }
+        self.function_tool_api_call_details.append(api_call_detail)
+        return api_call_detail
+
+    @staticmethod
+    def _finalize_api_call_detail(api_call_detail, response=None, status_code=None, content_type=None, error=None):
+        if api_call_detail is None:
+            return
+
+        completed_at = datetime.now()
+        api_call_detail["completed_at"] = completed_at.isoformat()
+        api_call_detail["latency_ms"] = None
+        started_at = api_call_detail.get("started_at")
+        if started_at:
+            try:
+                started_at_dt = datetime.fromisoformat(started_at)
+                api_call_detail["latency_ms"] = round((completed_at - started_at_dt).total_seconds() * 1000, 2)
+            except ValueError:
+                logger.warning(f"Could not compute api call latency from started_at={started_at}")
+        if error is not None:
+            api_call_detail["status"] = "error"
+            api_call_detail["error"] = str(error)
+        else:
+            api_call_detail["status"] = "completed"
+        api_call_detail["response_status_code"] = status_code
+        api_call_detail["response_content_type"] = content_type
+        api_call_detail["response_body"] = copy.deepcopy(response)
+        try:
+            api_call_detail["response_json"] = (
+                json.loads(response) if isinstance(response, str) else copy.deepcopy(response)
+            )
+        except (TypeError, json.JSONDecodeError):
+            api_call_detail["response_json"] = None
+
+    @property
+    def history(self):
+        return self.conversation_history.messages
+
+    @history.setter
+    def history(self, value):
+        self.conversation_history._messages = value
+
+    @property
+    def interim_history(self):
+        return self.conversation_history.interim
+
+    @interim_history.setter
+    def interim_history(self, value):
+        self.conversation_history._interim = value
+
+    @property
+    def language(self) -> str:
+        """Active language code.
+
+        Returns the language-detector's result when detection has completed
+        (non-multilingual path only: detection is disabled for multilingual
+        pools, so dominant_language is always None). Falls back to the
+        configured/switched language otherwise.
+        """
+        detector = getattr(self, "language_detector", None)
+        if detector is not None:
+            detected = detector.dominant_language
+            if detected:
+                return detected
+        return self._language
+
+    @language.setter
+    def language(self, value: str):
+        logger.info(f"Setting base language to {value}")
+        self._language = value
+
+    @property
+    def call_hangup_message(self):
+        return select_message_by_language(self.call_hangup_message_config, self.language)
+
+    def __is_multiagent(self):
+        if self.task_config["task_type"] == "webhook":
+            return False
+        agent_type = self.task_config["tools_config"]["llm_agent"].get("agent_type", None)
+        return agent_type == "multiagent"
+
+    def __is_knowledgebase_agent(self):
+        if self.task_config["task_type"] == "webhook":
+            return False
+        agent_type = self.task_config["tools_config"]["llm_agent"].get("agent_type", None)
+        return agent_type == "knowledgebase_agent"
+
+    def __is_graph_agent(self):
+        if self.task_config["task_type"] == "webhook":
+            return False
+        agent_type = self.task_config["tools_config"]["llm_agent"].get("agent_type", None)
+        return agent_type == "graph_agent"
+
+    # def __is_knowledge_agent(self):
+    #     if self.task_config["task_type"] == "webhook":
+    #         return False
+    #     agent_type = self.task_config['tools_config']["llm_agent"].get("agent_type", None)
+    #     return agent_type == "knowledge_agent"
+
+    def _invalidate_response_chain(self):
+        try:
+            llm_agent = self.tools.get("llm_agent")
+            if llm_agent and hasattr(llm_agent, "llm"):
+                llm_agent.llm.invalidate_response_chain()
+        except Exception as e:
+            logger.debug(f"Failed to invalidate response chain: {e}")
+
+    def _set_interruption_hint(self, heard_text):
+        try:
+            llm_agent = self.tools.get("llm_agent")
+            if llm_agent and hasattr(llm_agent, "llm"):
+                llm_agent.llm.set_interruption_hint(heard_text)
+        except Exception as e:
+            logger.debug(f"Failed to set interruption hint: {e}")
+
+    def _cancel_in_flight_llm_response(self):
+        try:
+            llm_agent = self.tools.get("llm_agent")
+            if llm_agent and hasattr(llm_agent, "llm"):
+                llm_agent.llm.cancel_in_flight_response()
+        except Exception as e:
+            logger.debug(f"cancel_in_flight_response failed: {e}")
+
+    def _inject_language_instruction(self, messages: list) -> list:
+        """Inject language instruction into messages based on detected language."""
+        lang = self.language_detector.dominant_language
+        if not lang or not self.language_injection_mode or not self.language_instruction_template:
+            return messages
+
+        try:
+            lang_name = LANGUAGE_NAMES.get(lang, lang)
+            instruction = self.language_instruction_template.format(language=lang_name) + "\n\n"
+
+            if self.language_injection_mode == "system_only":
+                for i, msg in enumerate(messages):
+                    if msg.get("role") == "system":
+                        messages[i]["content"] = instruction + msg["content"]
+                        logger.info(f"[system_only] Injected: {lang_name} ({lang})")
+                        break
+            elif self.language_injection_mode == "per_turn":
+                for i, msg in enumerate(messages):
+                    if msg.get("role") == "user":
+                        messages[i]["content"] = instruction + msg["content"]
+                logger.info(
+                    f"[per_turn] Injected to {sum(1 for m in messages if m.get('role') == 'user')} user messages: {lang_name} ({lang})"
+                )
+        except Exception as e:
+            logger.error(f"Language injection error: {e}")
+
+        return messages
+
+    async def _inject_retrieved_context(self, messages: list) -> list:
+        """Insert per-turn retrieved context just before the latest user message.
+
+        `context_provider` (an async callable taking the message list and
+        returning text) arrives through kwargs. The insert lands on this turn's
+        copy of the messages only, never in history, so retrieved passages
+        don't accumulate across turns. Any failure leaves the turn untouched.
+        """
+        provider = self.kwargs.get("context_provider")
+        if provider is None:
+            return messages
+        try:
+            context = await provider(messages)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Context provider failed: {e}")
+            return messages
+        if not context:
+            return messages
+        last_user = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=len(messages))
+        return messages[:last_user] + [{"role": "system", "content": context}] + messages[last_user:]
+
+    def __setup_output_handlers(self, turn_based_conversation, output_queue):
+        output_kwargs = {"websocket": self.websocket}
+
+        if self.task_config["tools_config"]["output"] is None:
+            logger.info("Not setting up any output handler as it is none")
+        elif self.task_config["tools_config"]["output"]["provider"] in SUPPORTED_OUTPUT_HANDLERS.keys():
+            # Explicitly use default for turn based conversation as we expect to use HTTP endpoints
+            if turn_based_conversation:
+                logger.info("Connected through dashboard and hence using default output handler")
+                output_handler_class = SUPPORTED_OUTPUT_HANDLERS.get("default")
+            else:
+                output_handler_class = SUPPORTED_OUTPUT_HANDLERS.get(
+                    self.task_config["tools_config"]["output"]["provider"]
+                )
+
+                if self.task_config["tools_config"]["output"]["provider"] in SUPPORTED_OUTPUT_TELEPHONY_HANDLERS.keys():
+                    output_kwargs["mark_event_meta_data"] = self.mark_event_meta_data
+                    logger.info(f"Making sure that the sampling rate for output handler is 8000")
+                    self.task_config["tools_config"]["synthesizer"]["provider_config"]["sampling_rate"] = 8000
+                    # sip-trunk (Asterisk) uses ulaw; other telephony use pcm (handler converts to mulaw)
+                    if self.task_config["tools_config"]["output"]["provider"] == TelephonyProvider.SIP_TRUNK.value:
+                        self.task_config["tools_config"]["synthesizer"]["audio_format"] = "ulaw"
+                        logger.info(f"Setting synthesizer audio format to ulaw for Asterisk sip-trunk")
+                        # Pass input handler to output handler so it can simulate mark events
+                        input_handler = self.tools.get("input")
+                        output_kwargs["input_handler"] = input_handler
+                        output_kwargs["asterisk_media_start"] = (self.context_data or {}).get("media_start_data")
+                        output_kwargs["agent_config"] = {"tasks": [self.task_config]}
+                        logger.info(
+                            f"Passing input_handler to sip-trunk output handler for mark event simulation: {input_handler is not None}"
+                        )
+                    else:
+                        self.task_config["tools_config"]["synthesizer"]["audio_format"] = "pcm"
+                elif self.is_web_based_call:
+                    # Keep whatever rate the config asked for. A browser is told
+                    # the playback rate out of band and resamples on playout, so
+                    # the synth should run at its model's native one — forcing
+                    # 24000 makes every chunk resample independently, and with no
+                    # filter state carried across chunks each boundary gets an
+                    # edge transient that clicks between sentences (see
+                    # app/config.py:tts_sample_rate). Unset still means 24000.
+                    self.task_config["tools_config"]["synthesizer"]["provider_config"].setdefault(
+                        "sampling_rate", WEBCALL_TTS_SAMPLE_RATE
+                    )
+                    output_kwargs["queue"] = output_queue
+                else:
+                    self.task_config["tools_config"]["synthesizer"]["provider_config"]["sampling_rate"] = 24000
+                    output_kwargs["queue"] = output_queue
+                self.sampling_rate = self.task_config["tools_config"]["synthesizer"]["provider_config"]["sampling_rate"]
+
+            if self.task_config["tools_config"]["output"]["provider"] == "default":
+                output_kwargs["is_web_based_call"] = self.is_web_based_call
+                output_kwargs["mark_event_meta_data"] = self.mark_event_meta_data
+                output_kwargs["sampling_rate"] = self.sampling_rate
+
+            # FreeSWITCH streams PCM @ self.sampling_rate; no mark echo → self-complete via
+            # input_handler (input handler is set up before output, like sip-trunk).
+            if self.task_config["tools_config"]["output"]["provider"] == TelephonyProvider.FREESWITCH.value:
+                output_kwargs["mark_event_meta_data"] = self.mark_event_meta_data
+                output_kwargs["sampling_rate"] = self.sampling_rate
+                output_kwargs["input_handler"] = self.tools.get("input")
+
+            self.tools["output"] = output_handler_class(**output_kwargs)
+            self.output_handler_set = True
+            logger.info("output handler set")
+        else:
+            # raising a plain string surfaces as TypeError("exceptions must derive from
+            # BaseException") and hides which provider was unsupported
+            raise ValueError(f"Unsupported output provider: {self.task_config['tools_config']['output']['provider']}")
+
+    async def message_task_new(self):
+        tasks = []
+        if self._is_conversation_task():
+            tasks.append(self.tools["input"].handle())
+
+            if not self.turn_based_conversation and not self.is_web_based_call:
+                tasks.append(self.__forced_first_message())
+
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    def __setup_input_handlers(self, turn_based_conversation, input_queue, should_record):
+        if self.task_config["tools_config"]["input"]["provider"] in SUPPORTED_INPUT_HANDLERS.keys():
+            input_kwargs = {
+                "queues": self.queues,
+                "websocket": self.websocket,
+                "input_types": get_required_input_types(self.task_config),
+                "mark_event_meta_data": self.mark_event_meta_data,
+                "is_welcome_message_played": True
+                if self.task_config["tools_config"]["output"]["provider"] == "default" and not self.is_web_based_call
+                else False,
+            }
+
+            if should_record:
+                input_kwargs["conversation_recording"] = self.conversation_recording
+
+            if self.turn_based_conversation:
+                input_kwargs["turn_based_conversation"] = True
+                input_handler_class = SUPPORTED_INPUT_HANDLERS.get("default")
+                input_kwargs["queue"] = input_queue
+            else:
+                input_handler_class = SUPPORTED_INPUT_HANDLERS.get(
+                    self.task_config["tools_config"]["input"]["provider"]
+                )
+
+                if self.task_config["tools_config"]["input"]["provider"] == "default":
+                    input_kwargs["queue"] = input_queue
+
+                if self.task_config["tools_config"]["input"]["provider"] in (
+                    TelephonyProvider.PLIVO.value,
+                    TelephonyProvider.VOBIZ.value,
+                ) and self.kwargs.get("telephony_credentials"):
+                    input_kwargs["auth_credentials"] = self.kwargs["telephony_credentials"]
+
+                input_kwargs["observable_variables"] = self.observable_variables
+
+                # Asterisk (sip-trunk): pass context data for pre-parsed MEDIA_START
+                if (
+                    self.task_config["tools_config"]["input"]["provider"] == TelephonyProvider.SIP_TRUNK.value
+                    and self.context_data
+                ):
+                    input_kwargs["ws_context_data"] = self.context_data
+                    input_kwargs["agent_config"] = {"tasks": [self.task_config]}
+            self.tools["input"] = input_handler_class(**input_kwargs)
+        else:
+            # raising a plain string surfaces as TypeError("exceptions must derive from
+            # BaseException") and hides which provider was unsupported — this exact failure
+            # masked the missing-freeswitch-handler case when a PyPI vox shadowed the branch
+            raise ValueError(f"Unsupported input provider: {self.task_config['tools_config']['input']['provider']}")
+
+    async def __forced_first_message(self, timeout=10.0):
+        logger.info(f"Executing the first message task")
+        try:
+            delay_ms = int(self.welcome_message_delay or 0)
+            if delay_ms > 0:
+                logger.info(f"Welcome message delay set to {delay_ms} ms")
+                await asyncio.sleep(delay_ms / 1000)
+            start_time = asyncio.get_running_loop().time()
+            while True:
+                elapsed_time = asyncio.get_running_loop().time() - start_time
+                if elapsed_time > timeout:
+                    await self.__process_end_of_conversation()
+                    logger.warning("Timeout reached while waiting for stream_sid")
+                    break
+
+                text = self.kwargs.get("agent_welcome_message", None)
+                meta_info = {
+                    "io": self.tools["output"].get_provider(),
+                    "message_category": "agent_welcome_message",
+                    "request_id": str(uuid.uuid4()),
+                    "cached": True,
+                    "sequence_id": -1,
+                    "format": self.task_config["tools_config"]["output"]["format"],
+                    "text": text,
+                    "end_of_llm_stream": True,
+                }
+                ws_data_packet = create_ws_data_packet(text, meta_info=meta_info)
+
+                meta_info = ws_data_packet["meta_info"]
+                text = ws_data_packet["data"]
+                meta_info["type"] = "audio"
+                meta_info["synthesizer_start_time"] = time.time()
+
+                audio_chunk = self.preloaded_welcome_audio if self.preloaded_welcome_audio else None
+                if meta_info["text"] == "":
+                    audio_chunk = None
+
+                # Convert to ulaw for Asterisk/sip-trunk provider (cached welcome is PCM)
+                if self.tools["output"].get_provider() == TelephonyProvider.SIP_TRUNK.value and audio_chunk:
+                    original_size = len(audio_chunk)
+                    audio_chunk = pcm_to_ulaw(audio_chunk)
+                    logger.info(
+                        f"[SIP-TRUNK] Converted welcome message PCM to ulaw: {original_size} bytes -> {len(audio_chunk)} bytes"
+                    )
+                    meta_info["format"] = "ulaw"
+                else:
+                    meta_info["format"] = "pcm"
+                meta_info["is_first_chunk"] = True
+                meta_info["end_of_synthesizer_stream"] = True
+                meta_info["chunk_id"] = 1
+                meta_info["is_first_chunk_of_entire_response"] = True
+                meta_info["is_final_chunk_of_entire_response"] = True
+                message = create_ws_data_packet(audio_chunk, meta_info)
+
+                stream_sid = self.tools["input"].get_stream_sid()
+                if stream_sid is not None and self.output_handler_set:
+                    self.stream_sid_ts = time.time() * 1000
+                    await self._report_stream_connect()
+                    logger.info(f"Got stream sid and hence sending the first message {stream_sid}")
+                    self.stream_sid = stream_sid
+                    await self.tools["output"].set_stream_sid(stream_sid)
+
+                    if audio_chunk is None:
+                        # No welcome message to play - mark as played immediately
+                        # so the system doesn't wait for a mark event that will never arrive
+                        logger.info("No welcome message audio to send, marking welcome message as played")
+                        self.tools["input"].is_welcome_message_played = True
+                    else:
+                        self.tools["input"].update_is_audio_being_played(True)
+                        self.conversation_history.append_welcome_message(text)
+                        convert_to_request_log(
+                            message=text,
+                            meta_info=meta_info,
+                            component=LogComponent.SYNTHESIZER,
+                            direction=LogDirection.RESPONSE,
+                            model=self.synthesizer_provider,
+                            is_cached=meta_info.get("is_cached", False),
+                            engine=self.tools["synthesizer"].get_engine(),
+                            run_id=self.run_id,
+                        )
+                        await self.tools["output"].handle(message)
+                        try:
+                            data = message.get("data")
+                            if data is not None:
+                                duration = calculate_audio_duration(
+                                    len(data), self.sampling_rate, format=message["meta_info"]["format"]
+                                )
+                                self.welcome_message_duration_ms = round(duration * 1000, 2)
+                                if self.should_record:
+                                    self.conversation_recording["output"].append(
+                                        {"data": data, "start_time": time.time(), "duration": duration}
+                                    )
+                        except Exception as e:
+                            duration = 0.256
+                            self.welcome_message_duration_ms = round(duration * 1000, 2)
+                            logger.error(
+                                "Exception in __forced_first_message for duration calculation: {}".format(str(e))
+                            )
+                    break
+                else:
+                    logger.info(
+                        f"Stream id is still None ({stream_sid}) or output handler not set ({self.output_handler_set}), waiting..."
+                    )
+                    await asyncio.sleep(0.01)
+        except Exception as e:
+            logger.error(f"Exception in __forced_first_message {str(e)}")
+
+        return
+
+    def __inject_switch_language_tool(self):
+        """Auto-inject the switch_language tool when multilingual pools are active.
+        Sole switch mechanism in the legacy flow; explicit-request fast path in the
+        LLM-driven flow."""
+        has_pool = isinstance(self.tools.get("transcriber"), TranscriberPool) or isinstance(
+            self.tools.get("synthesizer"), SynthesizerPool
+        )
+        if not has_pool:
+            return
+
+        # Collect available labels from pools
+        labels = set()
+        if isinstance(self.tools.get("transcriber"), TranscriberPool):
+            labels.update(self.tools["transcriber"].labels)
+        if isinstance(self.tools.get("synthesizer"), SynthesizerPool):
+            labels.update(self.tools["synthesizer"].labels)
+
+        # Enrich the tool schema with available labels in the description
+        tool_def = copy.deepcopy(SWITCH_LANGUAGE_TOOL_DEFINITION)
+        custom_description = self.task_config.get("tools_config", {}).get("switch_tool_description")
+        if custom_description:
+            tool_def["function"]["description"] = custom_description
+        lang_prop = tool_def["function"]["parameters"]["properties"]["language"]
+        lang_prop["enum"] = sorted(labels)
+        lang_prop["description"] = f"Language to switch to. Available: {sorted(labels)}"
+
+        if self.kwargs.get("api_tools") is None:
+            self.kwargs["api_tools"] = {"tools": [], "tools_params": {}}
+
+        self.kwargs["api_tools"]["tools"].append(tool_def)
+        # Entry must exist in tools_params so ToolCallAccumulator.build_api_payload
+        # doesn't drop the call, but no pre_call_message — the switch is silent.
+        # (switch_handoff_messages / agent_names are loaded for both flows at the
+        # setup call site, before this injection.)
+        self.kwargs["api_tools"]["tools_params"]["switch_language"] = {}
+        logger.info(f"Injected switch_language tool (labels={sorted(labels)})")
+
+    def _get_voice_name_for_label(self, label):
+        """Get agent name for a language label from configured agent_names."""
+        return self.agent_names.get(label, "")
+
+    def __setup_transcriber(self):
+        try:
+            if self.task_config["tools_config"]["transcriber"] is not None:
+                transcriber_config = self.task_config["tools_config"]["transcriber"]
+
+                self.transcriber_provider = transcriber_config.get("provider", transcriber_config.get("model"))
+
+                # --- Multilingual pool path ---
+                if "multilingual" in transcriber_config and transcriber_config.get("multilingual"):
+                    multilingual = transcriber_config["multilingual"]
+                    active_label = transcriber_config.get("active", DEFAULT_LANGUAGE_CODE)
+                    self.language = active_label
+                    if hasattr(self, "language_detector"):
+                        self.language_detector.set_enabled_status(
+                            False
+                        )  # Disable language detection when using multilingual pool
+
+                    if self.turn_based_conversation:
+                        provider = "playground"
+                    elif self.is_web_based_call:
+                        provider = "web_based_call"
+                    else:
+                        provider = self.task_config["tools_config"]["input"]["provider"]
+
+                    is_sip = provider == TelephonyProvider.SIP_TRUNK.value
+
+                    transcribers = {}
+                    for label, cfg in multilingual.items():
+                        private_queue = asyncio.Queue()
+                        cfg["input_queue"] = private_queue
+                        cfg["output_queue"] = self.transcriber_output_queue
+                        if is_sip:
+                            cfg["encoding"] = "mulaw"
+                            cfg["sampling_rate"] = 8000
+                        elif provider in (WEB_BASED_CALL_PROVIDER, TelephonyProvider.FREESWITCH.value):
+                            cfg["encoding"] = "linear16"
+                            cfg["sampling_rate"] = 16000
+                        if self.turn_based_conversation:
+                            cfg["stream"] = True if self.enforce_streaming else False
+
+                        if "provider" in cfg:
+                            cls = SUPPORTED_TRANSCRIBER_PROVIDERS.get(cfg["provider"])
+                        else:
+                            cls = SUPPORTED_TRANSCRIBER_MODELS.get(cfg["model"])
+                        transcribers[label] = cls(provider, **cfg, **self.kwargs)
+
+                        if label == active_label:
+                            self.transcriber_provider = cfg.get("provider", cfg.get("model"))
+
+                    # Detector tap: enabled → per-turn buffer feeds the Switch LLM; disabled → legacy heuristic.
+                    LID_PROVIDER = self.task_config.get("tools_config", {}).get(
+                        "language_switch_lid_provider"
+                    ) or os.getenv("LID_PROVIDER", "sarvam")
+                    lid_config = {"telephony_provider": provider}
+                    switch_enabled = self.__language_switch_enabled()
+                    if switch_enabled:
+                        # language_switch_llm (from the azure flag) overrides the model; absent → default.
+                        self.language_switcher = LanguageSwitcher(
+                            available_labels=list(transcribers.keys()),
+                            run_id=self.run_id,
+                            model=self.task_config.get("tools_config", {}).get("language_switch_llm"),
+                        )
+                        self.language_switcher.prewarm()  # pay the TLS handshake now
+
+                    self.tools["transcriber"] = TranscriberPool(
+                        transcribers=transcribers,
+                        shared_input_queue=self.audio_queue,
+                        output_queue=self.transcriber_output_queue,
+                        active_label=active_label,
+                        multilingual_config=multilingual,
+                        lid_provider=LID_PROVIDER,
+                        lid_config=lid_config,
+                        on_lid_switch=None if switch_enabled else self.switch_language,
+                    )
+                    logger.info(
+                        f"TranscriberPool created with labels={list(transcribers.keys())}, "
+                        f"active='{active_label}', language_switch_enabled={switch_enabled}, "
+                        f"lid_provider={LID_PROVIDER!r}, legacy_lid_heuristic={not switch_enabled}"
+                    )
+                    if switch_enabled:
+                        # Idle-flush fallback: recovers the stuck-language deadlock where
+                        # the locked ASR can't decode the caller's speech, so no main turn
+                        # ever fires and the switch decision would otherwise never run.
+                        self._lid_idle_watcher_task = asyncio.create_task(self.__lid_idle_watcher())
+                    return
+
+                # --- Single transcriber path (unchanged) ---
+                self.language = transcriber_config.get("language", DEFAULT_LANGUAGE_CODE)
+                if self.turn_based_conversation:
+                    provider = "playground"
+                elif self.is_web_based_call:
+                    provider = "web_based_call"
+                else:
+                    provider = self.task_config["tools_config"]["input"]["provider"]
+
+                transcriber_config["input_queue"] = self.audio_queue
+                transcriber_config["output_queue"] = self.transcriber_output_queue
+
+                # Configure encoding for Asterisk/sip-trunk (uses ulaw like Twilio)
+                if provider == TelephonyProvider.SIP_TRUNK.value:
+                    transcriber_config["encoding"] = "mulaw"
+                    transcriber_config["sampling_rate"] = 8000
+                    logger.info(f"Configured transcriber for Asterisk sip-trunk with mulaw encoding @ 8kHz")
+                elif provider in (WEB_BASED_CALL_PROVIDER, TelephonyProvider.FREESWITCH.value):
+                    # Web + FreeSWITCH fork both stream linear16 PCM @16kHz; coerce for all ASR providers.
+                    transcriber_config["encoding"] = "linear16"
+                    transcriber_config["sampling_rate"] = 16000
+
+                # Checking models for backwards compatibility
+                if (
+                    transcriber_config["model"] in SUPPORTED_TRANSCRIBER_MODELS.keys()
+                    or transcriber_config["provider"] in SUPPORTED_TRANSCRIBER_PROVIDERS.keys()
+                ):
+                    if self.turn_based_conversation:
+                        transcriber_config["stream"] = True if self.enforce_streaming else False
+                        logger.info(
+                            f"transcriber stream={transcriber_config['stream']} enforce_streaming={self.enforce_streaming}"
+                        )
+                    if "provider" in transcriber_config:
+                        transcriber_class = SUPPORTED_TRANSCRIBER_PROVIDERS.get(transcriber_config["provider"])
+                    else:
+                        transcriber_class = SUPPORTED_TRANSCRIBER_MODELS.get(transcriber_config["model"])
+                    self.tools["transcriber"] = transcriber_class(provider, **transcriber_config, **self.kwargs)
+        except Exception as e:
+            logger.error(f"Something went wrong with starting transcriber {e}")
+
+    def __setup_synthesizer(self, llm_config=None):
+        if self._is_conversation_task():
+            self.kwargs["use_turbo"] = (
+                self.task_config["tools_config"]["transcriber"]["language"] == DEFAULT_LANGUAGE_CODE
+            )
+        if self.task_config["tools_config"]["synthesizer"] is not None:
+            synth_config = self.task_config["tools_config"]["synthesizer"]
+
+            # --- Multilingual pool path ---
+            if "multilingual" in synth_config:
+                multilingual = synth_config["multilingual"]
+                active_label = synth_config.get("active", DEFAULT_LANGUAGE_CODE)
+                if hasattr(self, "language_detector"):
+                    self.language_detector.set_enabled_status(
+                        False
+                    )  # Disable language detection when using multilingual pool
+
+                # Telephony providers expect mulaw@8000Hz — force use_mulaw for all synths in the pool
+                output_provider = self.task_config["tools_config"]["output"]["provider"]
+                is_telephony = output_provider in (
+                    TelephonyProvider.PLIVO.value,
+                    TelephonyProvider.TWILIO.value,
+                    TelephonyProvider.EXOTEL.value,
+                    TelephonyProvider.VOBIZ.value,
+                    TelephonyProvider.SIP_TRUNK.value,
+                )
+                synthesizer_kwargs = self.kwargs.copy()
+                if is_telephony:
+                    synthesizer_kwargs["use_mulaw"] = True
+                elif self.is_web_based_call or output_provider == TelephonyProvider.FREESWITCH.value:
+                    # web/freeswitch play raw PCM @24k; synths like elevenlabs/cartesia default to
+                    # mulaw@8k (telephony) which garbles when labeled 24k — force it off.
+                    synthesizer_kwargs["use_mulaw"] = False
+
+                synthesizers = {}
+                for label, cfg in multilingual.items():
+                    cfg = dict(cfg)  # shallow copy so pops don't mutate original
+                    caching = cfg.pop("caching", True)
+                    provider_name = cfg.pop("provider")
+                    provider_config = cfg.pop("provider_config")
+
+                    # Web + FreeSWITCH play raw PCM at a fixed 24kHz; force every language synth to
+                    # match (telephony/chat untouched). Else non-24k languages drift (e.g. Hindi too slow).
+                    if self.is_web_based_call or (
+                        self.task_config["tools_config"]["output"]["provider"] == TelephonyProvider.FREESWITCH.value
+                    ):
+                        provider_config = dict(provider_config)  # don't mutate the cached agent config
+                        provider_config["sampling_rate"] = WEBCALL_TTS_SAMPLE_RATE
+                        cfg.pop("sampling_rate", None)  # avoid passing sampling_rate twice to the synth
+
+                    if self.turn_based_conversation:
+                        cfg["audio_format"] = "mp3"
+                        cfg["stream"] = True if self.enforce_streaming else False
+
+                    cls = SUPPORTED_SYNTHESIZER_MODELS.get(provider_name)
+                    synthesizers[label] = cls(**cfg, **provider_config, **synthesizer_kwargs, caching=caching)
+
+                # Use active synth's provider/voice for logging metadata, and buffer_size
+                # Note that in the current state, buffer_size of other synth configs is ignored
+                active_cfg = synth_config
+                if active_label in multilingual:
+                    active_cfg = multilingual[active_label]
+
+                self.synthesizer_provider = active_cfg.get("provider", "unknown")
+                self.synthesizer_voice = active_cfg.get("provider_config", {}).get("voice", "unknown")
+
+                self.tools["synthesizer"] = SynthesizerPool(
+                    synthesizers=synthesizers, active_label=active_label, multilingual_config=multilingual
+                )
+
+                logger.info(f"SynthesizerPool created with labels={list(synthesizers.keys())}, active='{active_label}'")
+
+                # Pre-render every language's handoff clip on its own voice (background;
+                if self.language_switcher is not None and not self.turn_based_conversation:
+                    if self.task_config["tools_config"]["output"]["provider"] != "default":
+                        self.handoff_prewarm_task = asyncio.create_task(self.__prewarm_handoff_clips())
+
+                if self.task_config["tools_config"]["llm_agent"] is not None and llm_config is not None:
+                    llm_config["buffer_size"] = active_cfg.get("buffer_size")
+                return
+
+            # --- Single synthesizer path (apna normal path) ---
+            if "caching" in synth_config:
+                caching = synth_config.pop("caching")
+            else:
+                caching = True
+
+            self.synthesizer_provider = synth_config.pop("provider")
+            synthesizer_class = SUPPORTED_SYNTHESIZER_MODELS.get(self.synthesizer_provider)
+            provider_config = synth_config.pop("provider_config")
+            self.synthesizer_voice = provider_config["voice"]
+            self.synthesizer_voice_id = provider_config.get("voice_id")
+            self.synthesizer_model = provider_config.get("model")
+            if self.turn_based_conversation:
+                synth_config["audio_format"] = "mp3"  # Hard code mp3 if we're connected through dashboard
+                synth_config["stream"] = (
+                    True if self.enforce_streaming else False
+                )  # Hardcode stream to be False as we don't want to get blocked by a __listen_synthesizer co-routine
+
+            # Telephony providers expect mulaw@8000Hz — force use_mulaw regardless of the
+            # server-side kwarg (it defaults to False and only covers some synths), mirroring
+            # the multilingual-pool path above. Synths that honor the kwarg (e.g. cartesia)
+            # would otherwise stream raw PCM that telephony plays as mulaw → loud static.
+            output_provider = self.task_config["tools_config"]["output"]["provider"]
+            is_telephony = output_provider in (
+                TelephonyProvider.PLIVO.value,
+                TelephonyProvider.TWILIO.value,
+                TelephonyProvider.EXOTEL.value,
+                TelephonyProvider.VOBIZ.value,
+                TelephonyProvider.SIP_TRUNK.value,
+            )
+            synthesizer_kwargs = self.kwargs.copy()
+            if is_telephony:
+                synthesizer_kwargs["use_mulaw"] = True
+            elif self.is_web_based_call or output_provider == TelephonyProvider.FREESWITCH.value:
+                # web/freeswitch play raw PCM @24k — synths must not emit telephony mulaw@8k
+                synthesizer_kwargs["use_mulaw"] = False
+
+            self.tools["synthesizer"] = synthesizer_class(
+                **synth_config, **provider_config, **synthesizer_kwargs, caching=caching
+            )
+            # if not self.turn_based_conversation:
+            #     self.synthesizer_monitor_task = asyncio.create_task(self.tools['synthesizer'].monitor_connection())
+            if self.task_config["tools_config"]["llm_agent"] is not None and llm_config is not None:
+                llm_config["buffer_size"] = synth_config.get("buffer_size")
+
+    def __setup_llm(self, llm_config, task_id=0):
+        if self.task_config["tools_config"]["llm_agent"] is not None:
+            if task_id and task_id > 0:
+                self.kwargs.pop("llm_key", None)
+                self.kwargs.pop("base_url", None)
+                self.kwargs.pop("api_version", None)
+
+                if self._is_summarization_task() or self._is_extraction_task():
+                    llm_config["model"] = LLM_DEFAULT_CONFIGS["summarization"]["model"]
+                    llm_config["provider"] = LLM_DEFAULT_CONFIGS["summarization"]["provider"]
+
+            if llm_config["provider"] in SUPPORTED_LLM_PROVIDERS.keys():
+                llm_class = SUPPORTED_LLM_PROVIDERS.get(llm_config["provider"])
+                llm = llm_class(language=self.language, **llm_config, **self.kwargs)
+                return llm
+            else:
+                raise Exception(f"LLM {llm_config['provider']} not supported")
+
+    def __get_agent_object(self, llm, agent_type, assistant_config=None):
+        self.agent_type = agent_type
+        if agent_type == "simple_llm_agent":
+            llm_agent = StreamingContextualAgent(llm)
+        elif agent_type == "graph_agent":
+            logger.info("Setting up graph agent with rag-proxy-server support")
+            llm_config = self.task_config["tools_config"]["llm_agent"].get("llm_config", {})
+            rag_server_url = self.kwargs.get("rag_server_url", os.getenv("RAG_SERVER_URL", "http://localhost:8000"))
+
+            logger.info(f"Graph agent config: {llm_config}")
+            logger.info(f"RAG server URL: {rag_server_url}")
+
+            # Set RAG server URL in environment for GraphAgent to use
+            os.environ["RAG_SERVER_URL"] = rag_server_url
+
+            # Inject provider credentials for routing and response generation
+            injected_cfg = dict(llm_config)
+            if "llm_key" in self.kwargs:
+                injected_cfg["llm_key"] = self.kwargs["llm_key"]
+            if "base_url" in self.kwargs:
+                injected_cfg["base_url"] = self.kwargs["base_url"]
+
+            # Pass context_data for variable replacement in node prompts
+            if self.context_data:
+                injected_cfg["context_data"] = self.context_data
+
+            if "api_version" in self.kwargs:
+                injected_cfg["api_version"] = self.kwargs["api_version"]
+            if "api_tools" in self.kwargs:
+                injected_cfg["api_tools"] = self.kwargs["api_tools"]
+            if "reasoning_effort" in self.kwargs:
+                injected_cfg["reasoning_effort"] = self.kwargs["reasoning_effort"]
+            if "reasoning_summary" in self.kwargs:
+                injected_cfg["reasoning_summary"] = self.kwargs["reasoning_summary"]
+            if "service_tier" in self.kwargs:
+                injected_cfg["service_tier"] = self.kwargs["service_tier"]
+            if "routing_reasoning_effort" in self.kwargs:
+                injected_cfg["routing_reasoning_effort"] = self.kwargs["routing_reasoning_effort"]
+            if "routing_max_tokens" in self.kwargs:
+                injected_cfg["routing_max_tokens"] = self.kwargs["routing_max_tokens"]
+            if self.llm_config.get("use_responses_api"):
+                injected_cfg["use_responses_api"] = True
+            if self.llm_config.get("compact_threshold"):
+                injected_cfg["compact_threshold"] = self.llm_config["compact_threshold"]
+            injected_cfg["buffer_size"] = self.task_config["tools_config"]["synthesizer"].get("buffer_size")
+            injected_cfg["language"] = self.language
+            injected_cfg["turn_based_conversation"] = self.turn_based_conversation
+
+            llm_agent = GraphAgent(injected_cfg)
+            logger.info("Graph agent created with rag-proxy-server support")
+        elif agent_type == "knowledgebase_agent":
+            logger.info("Setting up knowledge agent with rag-proxy-server support")
+            llm_config = self.task_config["tools_config"]["llm_agent"].get("llm_config", {})
+            rag_server_url = self.kwargs.get("rag_server_url", os.getenv("RAG_SERVER_URL", "http://localhost:8000"))
+
+            logger.info(f"Knowledge agent config: {llm_config}")
+            logger.info(f"RAG server URL: {rag_server_url}")
+
+            # Set RAG server URL in environment for KnowledgeAgent to use
+            os.environ["RAG_SERVER_URL"] = rag_server_url
+
+            # Inject provider credentials and endpoints into KnowledgeAgent config
+            injected_cfg = dict(llm_config)
+            if "llm_key" in self.kwargs:
+                injected_cfg["llm_key"] = self.kwargs["llm_key"]
+            if "base_url" in self.kwargs:
+                injected_cfg["base_url"] = self.kwargs["base_url"]
+            if "api_version" in self.kwargs:
+                injected_cfg["api_version"] = self.kwargs["api_version"]
+            if "api_tools" in self.kwargs:
+                injected_cfg["api_tools"] = self.kwargs["api_tools"]
+            if "reasoning_effort" in self.kwargs:
+                injected_cfg["reasoning_effort"] = self.kwargs["reasoning_effort"]
+            if "reasoning_summary" in self.kwargs:
+                injected_cfg["reasoning_summary"] = self.kwargs["reasoning_summary"]
+            if "service_tier" in self.kwargs:
+                injected_cfg["service_tier"] = self.kwargs["service_tier"]
+            if self.llm_config.get("use_responses_api"):
+                injected_cfg["use_responses_api"] = True
+            if self.llm_config.get("compact_threshold"):
+                injected_cfg["compact_threshold"] = self.llm_config["compact_threshold"]
+            injected_cfg["buffer_size"] = self.task_config["tools_config"]["synthesizer"].get("buffer_size")
+            injected_cfg["language"] = self.language
+
+            llm_agent = KnowledgeBaseAgent(injected_cfg)
+            logger.info("Knowledge agent created with rag-proxy-server support")
+        else:
+            raise f"{agent_type} Agent type is not created yet"
+        return llm_agent
+
+    def __setup_tasks(self, llm=None, agent_type=None, assistant_config=None):
+        if self.task_config["task_type"] == "conversation" and not self.__is_multiagent():
+            self.tools["llm_agent"] = self.__get_agent_object(llm, agent_type, assistant_config)
+        elif self.__is_multiagent():
+            return self.__get_agent_object(llm, agent_type, assistant_config)
+        elif self.task_config["task_type"] == "extraction":
+            logger.info("Setting up extraction agent")
+            self.tools["llm_agent"] = ExtractionContextualAgent(llm, prompt=self.system_prompt)
+            self.extracted_data = None
+        elif self.task_config["task_type"] == "summarization":
+            logger.info("Setting up summarization agent")
+            self.tools["llm_agent"] = SummarizationContextualAgent(llm, prompt=self.system_prompt)
+            self.summarized_data = None
+        logger.info("prompt and config setup completed")
+
+    ########################
+    # Helper methods
+    ########################
+
+    def __get_final_prompt(self, prompt, today, current_time, current_timezone):
+        enriched_prompt = prompt
+        if self.context_data is not None:
+            enrich_context_with_time_variables(self.context_data, current_timezone)
+            enriched_prompt = update_prompt_with_context(enriched_prompt, self.context_data)
+        notes = "### Note:\n"
+        if self._is_conversation_task() and self.use_fillers:
+            notes += f"1.{FILLER_PROMPT}\n"
+        return f"{enriched_prompt}\n{notes}\n{DATE_PROMPT.format(today, current_time, current_timezone)}"
+
+    async def load_prompt(self, assistant_name, task_id, local, **kwargs):
+        if self.task_config["task_type"] == "webhook":
+            return
+
+        agent_type = self.task_config["tools_config"]["llm_agent"].get("agent_type", "simple_llm_agent")
+        self.is_local = local
+        if task_id == 0:
+            if (
+                self.context_data
+                and "recipient_data" in self.context_data
+                and self.context_data["recipient_data"]
+                and self.context_data["recipient_data"].get("timezone", None)
+            ):
+                self.timezone = pytz.timezone(self.context_data["recipient_data"]["timezone"])
+        current_date, current_time = get_date_time_from_timezone(self.timezone)
+
+        prompt_responses = kwargs.get("prompt_responses", None)
+        if not prompt_responses:
+            prompt_responses = await get_prompt_responses(assistant_id=self.assistant_id, local=self.is_local)
+
+        current_task = "task_{}".format(task_id + 1)
+        if self.__is_multiagent():
+            logger.info(
+                f"Getting {current_task} from prompt responses of type {type(prompt_responses)}, prompt responses key {prompt_responses.keys()}"
+            )
+            prompts = prompt_responses.get(current_task, None)
+            self.prompt_map = {}
+            for agent in self.task_config["tools_config"]["llm_agent"]["llm_config"]["agent_map"]:
+                prompt = prompts[agent]["system_prompt"]
+                prompt = self.__prefill_prompts(self.task_config, prompt, self.task_config["task_type"])
+                prompt = self.__get_final_prompt(prompt, current_date, current_time, self.timezone)
+                if agent == self.task_config["tools_config"]["llm_agent"]["llm_config"]["default_agent"]:
+                    self.system_prompt = {"role": "system", "content": prompt}
+                self.prompt_map[agent] = prompt
+            logger.info(f"Initialised prompt dict {self.prompt_map}, Set default prompt {self.system_prompt}")
+        else:
+            self.prompts = self.__prefill_prompts(
+                self.task_config, prompt_responses.get(current_task, None), self.task_config["task_type"]
+            )
+
+        if "system_prompt" in self.prompts:
+            # This isn't a graph based agent
+            enriched_prompt = self.prompts["system_prompt"]
+            if self.context_data and self.context_data.get("recipient_data", {}).get("call_sid"):
+                self.call_sid = self.context_data["recipient_data"]["call_sid"]
+
+            enriched_prompt = structure_system_prompt(
+                self.prompts["system_prompt"],
+                self.run_id,
+                self.assistant_id,
+                self.call_sid,
+                self.context_data,
+                self.timezone,
+                self.is_web_based_call,
+            )
+
+            notes = ""
+            if self._is_conversation_task() and self.use_fillers:
+                notes = "### Note:\n"
+                notes += f"1.{FILLER_PROMPT}\n"
+
+            final_prompt = f"\n## Agent Prompt:\n\n{enriched_prompt}\n{notes}\n\n## Transcript:\n"
+            self.prompts["system_prompt"] = final_prompt
+
+            self.system_prompt = {"role": "system", "content": final_prompt}
+        else:
+            self.system_prompt = {"role": "system", "content": ""}
+
+        self.conversation_history.setup_system_prompt(self.system_prompt)
+
+        self.multilingual_prompts = {}
+        raw_multilingual = prompt_responses.get(current_task, {}).get("multilingual_prompts", {})
+        if raw_multilingual and not self.__is_multiagent():
+            for lang_code, lang_prompt in raw_multilingual.items():
+                enriched = structure_system_prompt(
+                    lang_prompt,
+                    self.run_id,
+                    self.assistant_id,
+                    self.call_sid,
+                    self.context_data,
+                    self.timezone,
+                    self.is_web_based_call,
+                )
+                notes = ""
+                if self._is_conversation_task() and self.use_fillers:
+                    notes = "### Note:\n"
+                    notes += f"1.{FILLER_PROMPT}\n"
+                self.multilingual_prompts[lang_code] = f"\n## Agent Prompt:\n\n{enriched}\n{notes}\n\n## Transcript:\n"
+            logger.info(f"Loaded multilingual prompts for languages: {list(self.multilingual_prompts.keys())}")
+
+        # If using knowledge_agent, inject the prompt into agent config so agent can read it
+        try:
+            if self.__is_knowledgebase_agent() and "llm_agent" in self.task_config["tools_config"]:
+                if "llm_config" in self.task_config["tools_config"]["llm_agent"]:
+                    self.task_config["tools_config"]["llm_agent"]["llm_config"]["prompt"] = self.system_prompt[
+                        "content"
+                    ]
+        except Exception as e:
+            logger.error(f"Failed to inject prompt into knowledge agent config: {e}")
+
+    def __prefill_prompts(self, task, prompt, task_type):
+        if (
+            self.context_data
+            and "recipient_data" in self.context_data
+            and self.context_data["recipient_data"]
+            and self.context_data["recipient_data"].get("timezone", None)
+        ):
+            self.timezone = pytz.timezone(self.context_data["recipient_data"]["timezone"])
+        current_date, current_time = get_date_time_from_timezone(self.timezone)
+
+        if not prompt and task_type in ("extraction", "summarization"):
+            if task_type == "extraction":
+                extraction_json = (
+                    task.get("tools_config").get("llm_agent", {}).get("llm_config", {}).get("extraction_json")
+                )
+                prompt = EXTRACTION_PROMPT.format(current_date, current_time, self.timezone, extraction_json)
+                return {"system_prompt": prompt}
+            elif task_type == "summarization":
+                return {"system_prompt": SUMMARIZATION_PROMPT}
+        return prompt
+
+    def __process_stop_words(self, text_chunk, meta_info):
+        # THis is to remove stop words. Really helpful in smaller 7B models
+        if "end_of_llm_stream" in meta_info and meta_info["end_of_llm_stream"] and "user" in text_chunk[-5:].lower():
+            if text_chunk[-5:].lower() == "user:":
+                text_chunk = text_chunk[:-5]
+            elif text_chunk[-4:].lower() == "user":
+                text_chunk = text_chunk[:-4]
+
+        # index = text_chunk.find("AI")
+        # if index != -1:
+        #     text_chunk = text_chunk[index+2:]
+        return text_chunk
+
+    def update_transcript_for_interruption(self, original_stream, heard_text):
+        """Trim original response to match what was actually heard."""
+        if original_stream is None:
+            return heard_text.strip() if heard_text else None
+
+        if not heard_text or not heard_text.strip():
+            return ""
+
+        heard_text = heard_text.strip()
+
+        # Try exact match
+        index = original_stream.find(heard_text)
+        if index != -1:
+            return original_stream[: index + len(heard_text)]
+
+        # Try progressively shorter prefixes (handles synthesizer trailing spaces)
+        if len(heard_text) > 3 and original_stream[:3] == heard_text[:3]:
+            for i in range(len(heard_text), 0, -1):
+                partial = heard_text[:i].strip()
+                if partial and original_stream.startswith(partial):
+                    return partial
+
+        # heard_text not found in original — stale/mismatched turn data.
+        # Treat as unheard rather than corrupting the message with foreign text.
+        logger.warning(
+            f"update_transcript_for_interruption: heard_text not found in original; treating as unheard. "
+            f"original[:30]={original_stream[:30]!r} heard[:30]={heard_text[:30]!r}"
+        )
+        return ""
+
+    @staticmethod
+    def _trim_partial_to_complete_words(text):
+        partial_text = (text or "").strip()
+        if not partial_text:
+            return ""
+
+        last_space = partial_text.rfind(" ")
+        if last_space <= 0:
+            return ""
+        return partial_text[:last_space]
+
+    @staticmethod
+    def _normalized_transcript_text(text):
+        return " ".join((text or "").strip().split())
+
+    @classmethod
+    def _prepare_precise_transcript_messages(cls, messages):
+        cleaned = []
+        for message in copy.deepcopy(messages):
+            role = message.get("role")
+            content = message.get("content")
+            role_value = role.value if hasattr(role, "value") else role
+
+            if cleaned and role_value == "user":
+                previous = cleaned[-1]
+                previous_role = previous.get("role")
+                previous_role_value = previous_role.value if hasattr(previous_role, "value") else previous_role
+                if previous_role_value == "user":
+                    current_text = cls._normalized_transcript_text(content)
+                    previous_text = cls._normalized_transcript_text(previous.get("content"))
+                    if current_text and previous_text and current_text.startswith(previous_text):
+                        logger.info(
+                            "Collapsing overlapping user transcript in precise transcript: previous=%r current=%r",
+                            previous.get("content"),
+                            content,
+                        )
+                        cleaned[-1] = message
+                        continue
+
+            cleaned.append(message)
+
+        return cleaned
+
+    @staticmethod
+    def _get_latest_turn_id_from_marks(mark_events_data):
+        latest_turn_id = None
+        latest_counter = -1
+        for _, mark_data in mark_events_data:
+            if mark_data.get("type") in NON_EVIDENCE_MARK_TYPES:
+                continue
+            turn_id = mark_data.get("turn_id")
+            if turn_id is None:
+                continue
+            counter = mark_data.get("counter", -1)
+            if counter >= latest_counter:
+                latest_counter = counter
+                latest_turn_id = turn_id
+        return latest_turn_id
+
+    @staticmethod
+    def _get_latest_response_uid_from_marks(mark_events_data):
+        latest_response_uid = None
+        latest_counter = -1
+        for _, mark_data in mark_events_data:
+            if mark_data.get("type") in NON_EVIDENCE_MARK_TYPES:
+                continue
+            response_uid = mark_data.get("response_uid")
+            if response_uid is None:
+                continue
+            counter = mark_data.get("counter", -1)
+            if counter >= latest_counter:
+                latest_counter = counter
+                latest_response_uid = response_uid
+        return latest_response_uid
+
+    def _get_latest_assistant_turn_id(self):
+        for msg in reversed(self.conversation_history.messages):
+            if msg.get("role") == ChatRole.ASSISTANT and msg.get("turn_id") is not None:
+                return msg.get("turn_id")
+        return None
+
+    def _get_latest_assistant_response_uid(self):
+        for msg in reversed(self.conversation_history.messages):
+            if msg.get("role") == ChatRole.ASSISTANT and msg.get("response_uid") is not None:
+                return msg.get("response_uid")
+        return None
+
+    def _has_interruptible_mark_activity(self):
+        for mark_data in self.mark_event_meta_data.mark_event_meta_data.values():
+            if mark_data.get("type") == "pre_mark_message":
+                continue
+            if mark_data.get("turn_id") is not None:
+                return True
+            sequence_id = mark_data.get("sequence_id")
+            if sequence_id is not None and sequence_id != -1:
+                return True
+        return False
+
+    def _inflight_response_activity(self, exclude_sequence_id=None) -> dict:
+        """Snapshot of the signals that mean an assistant response is in flight.
+
+        Single definition shared by the barge-in path (_handle_transcriber_output)
+        and the language-switch path so the meaning of "response in flight" can't
+        drift between them. The truthiness of the dict's values is the answer
+        (gate with any(activity.values())); the dict itself is log-friendly.
+
+        exclude_sequence_id: the barge-in path passes the current turn's
+        sequence_id so the fresh turn's own response isn't counted; the
+        language-switch path passes None because on a confirmed switch every
+        pending response is stale old-language output.
+        """
+        return {
+            "response_in_pipeline": self.response_in_pipeline,
+            "audio_playing": self.tools["input"].is_audio_being_played_to_user(),
+            "pending_marks": self._has_interruptible_mark_activity(),
+            "pending_sequences": self.interruption_manager.has_pending_responses_excluding(exclude_sequence_id),
+            "pending_generation": (self.llm_task is not None and not self.llm_task.done())
+            or (self.execute_function_call_task is not None and not self.execute_function_call_task.done()),
+        }
+
+    async def sync_history(self, mark_events_data, interruption_processed_at):
+        """Sync history to reflect only what was actually spoken. Uses confirmed text or falls back to pending marks."""
+        try:
+            mark_events_data = list(mark_events_data)
+            target_turn_id = self._get_latest_turn_id_from_marks(mark_events_data)
+            target_response_uid = self._get_latest_response_uid_from_marks(mark_events_data)
+            # Track whether target came from actual evidence (marks / acked text) vs a
+            # blind fallback.  We must NOT trim a previously-committed message (e.g. a
+            # filler) when a *later* interruption has no pending marks at all.
+            target_from_evidence = target_turn_id is not None or target_response_uid is not None
+            if target_turn_id is None:
+                target_turn_id = getattr(self.tools.get("input"), "last_heard_turn_id", None)
+            if target_response_uid is None:
+                target_response_uid = getattr(self.tools.get("input"), "last_heard_response_uid", None)
+            target_from_evidence = target_from_evidence or target_turn_id is not None or target_response_uid is not None
+            if target_turn_id is None:
+                target_turn_id = self._get_latest_assistant_turn_id()
+            if target_response_uid is None:
+                target_response_uid = self._get_latest_assistant_response_uid()
+            logger.info(
+                f"sync_history: target_turn_id={target_turn_id} target_response_uid={target_response_uid} marks={len(mark_events_data)} "
+                f"mark_ids={[mid for mid, _ in mark_events_data]}"
+            )
+            input_handler = self.tools["input"]
+            response_heard = input_handler.get_response_heard_for_response(target_response_uid)
+            if not response_heard:
+                response_heard = input_handler.get_response_heard_for_turn(target_turn_id)
+            if not response_heard:
+                response_heard = self.mark_event_meta_data.get_heard_text_for_response(target_response_uid)
+            if not response_heard:
+                response_heard = self.mark_event_meta_data.get_heard_text_for_turn(target_turn_id)
+            if not response_heard:
+                # Only fall back to global accumulator when target_turn_id is unknown.
+                # With a known target turn, the global can hold stale text from a
+                # previous turn (e.g. acked post-tool audio before reset), which
+                # would corrupt the wrong message.
+                if target_turn_id is None:
+                    response_heard = input_handler.response_heard_by_user
+                    target_turn_id = getattr(input_handler, "last_heard_turn_id", None)
+            logger.info(f"sync_history: response_heard len={len(response_heard) if response_heard else 0}")
+            if response_heard:
+                logger.info(f"response_heard (last 10 chars): {response_heard[-10:]}")
+
+            if not response_heard:
+                pending_marks = [{"mark_id": k, "mark_data": v} for k, v in mark_events_data]
+                pending_chunks = []
+                for mark in pending_marks:
+                    mark_data = mark.get("mark_data", {})
+                    mark_type = mark_data.get("type", "")
+                    text = mark_data.get("text_synthesized", "")
+                    if target_turn_id is not None and mark_data.get("turn_id") != target_turn_id:
+                        continue
+                    if mark_type in ["pre_mark_message", "backchanneling"] or not text:
+                        continue
+                    pending_chunks.append(
+                        {"text": text, "duration": mark_data.get("duration", 0), "sent_ts": mark_data.get("sent_ts", 0)}
+                    )
+
+                if pending_chunks:
+                    first_sent_ts = pending_chunks[0].get("sent_ts", 0)
+                    if first_sent_ts > 0:
+                        time_since_first_send = interruption_processed_at - first_sent_ts
+                        actual_play_time = max(0, time_since_first_send)
+                    else:
+                        elapsed_time = interruption_processed_at - self.tools["input"].get_current_mark_started_time()
+                        actual_play_time = max(0, elapsed_time)
+
+                    played_text = []
+                    cumulative_duration = 0
+                    for chunk in pending_chunks:
+                        if cumulative_duration >= actual_play_time:
+                            break
+                        chunk_duration = chunk["duration"]
+                        if cumulative_duration + chunk_duration <= actual_play_time:
+                            played_text.append(chunk["text"])
+                        else:
+                            remaining_time = actual_play_time - cumulative_duration
+                            proportion = remaining_time / chunk_duration if chunk_duration > 0 else 0
+                            char_count = int(len(chunk["text"]) * proportion)
+                            partial_text = chunk["text"][:char_count]
+                            if partial_text and char_count < len(chunk["text"]):
+                                partial_text = self._trim_partial_to_complete_words(partial_text)
+                            if partial_text:
+                                played_text.append(partial_text)
+                        cumulative_duration += chunk_duration
+
+                    if played_text:
+                        response_heard = "".join(played_text)
+                        logger.info(
+                            f"Estimated played text (last 10 chars): {response_heard[-10:]}, len={len(response_heard)}"
+                        )
+                else:
+                    # No text_synthesized on marks (streaming synths). Group pending
+                    # marks by turn_id and use audio duration to determine play state.
+                    pending_by_turn = {}  # turn_id → {seq_ids: set, pending_dur: float}
+                    for mark in pending_marks:
+                        mark_data = mark.get("mark_data", {})
+                        if mark_data.get("type") == "pre_mark_message":
+                            continue
+                        t_id = mark_data.get("turn_id")
+                        s_id = mark_data.get("sequence_id")
+                        if t_id is None:
+                            continue
+                        entry = pending_by_turn.setdefault(t_id, {"seq_ids": set(), "pending_dur": 0.0})
+                        if s_id is not None and s_id != -1:
+                            entry["seq_ids"].add(s_id)
+                        entry["pending_dur"] += mark_data.get("duration", 0.0)
+
+                    if not pending_by_turn:
+                        if target_turn_id is None:
+                            logger.info(
+                                "No pending marks with turn_id and no target_turn_id; "
+                                "skipping trim to avoid removing non-turn assistant messages like welcome"
+                            )
+                            return
+                        if not target_from_evidence:
+                            # target_turn_id was obtained via blind fallback (_get_latest_assistant_turn_id)
+                            # with no marks and no ack evidence — this is a second cleanup after a
+                            # previous one already committed the filler.  Do NOT remove it.
+                            logger.info(
+                                f"No pending marks and target_turn_id={target_turn_id} came from blind fallback; "
+                                "skipping trim to avoid removing already-committed history"
+                            )
+                            return
+                        logger.info(
+                            "No pending marks with turn_id to estimate played text; "
+                            f"will trim target_turn_id={target_turn_id} as unheard"
+                        )
+                        response_heard = ""
+
+                    else:
+                        # Use the most recently interrupted turn
+                        t_id = target_turn_id if target_turn_id in pending_by_turn else max(pending_by_turn.keys())
+                        target_turn_id = t_id
+                        info = pending_by_turn[t_id]
+                        msg = self._turn_msg_map.get(t_id)
+                        full_text = (msg.get("content") or "") if msg else ""
+
+                        # Sum total audio duration across ALL sequences for this turn
+                        # (not just sequences with pending marks), so that fully-acked
+                        # early sequences are included in the proportion calculation.
+                        total_dur = sum(
+                            seq_stat.total_audio_duration
+                            for seq_stat in self.mark_event_meta_data._mark_stats.per_sequence.values()
+                            if seq_stat.turn_id == t_id
+                        )
+                        if total_dur <= 0:
+                            # Fallback: use only pending sequences (may underestimate)
+                            total_dur = sum(
+                                self.mark_event_meta_data._mark_stats.per_sequence[s].total_audio_duration
+                                for s in info["seq_ids"]
+                                if s in self.mark_event_meta_data._mark_stats.per_sequence
+                            )
+
+                        if total_dur <= 0:
+                            logger.info(f"turn_id={t_id}: no duration stats, treating as fully unheard")
+                            response_heard = ""
+                        else:
+                            heard_dur = max(0.0, total_dur - info["pending_dur"])
+                            proportion = min(1.0, heard_dur / total_dur)
+                            logger.info(
+                                f"turn_id={t_id}: total={total_dur:.3f}s pending={info['pending_dur']:.3f}s proportion={proportion:.2f}"
+                            )
+
+                            if proportion >= 1.0:
+                                # Fully played — nothing to trim
+                                return
+
+                            if proportion > 0 and full_text.strip():
+                                char_count = int(len(full_text.strip()) * proportion)
+                                if char_count < len(full_text.strip()):
+                                    partial_text = self._trim_partial_to_complete_words(full_text.strip()[:char_count])
+                                    char_count = len(partial_text)
+                                response_heard = full_text.strip()[:char_count]
+                                logger.info(f"turn_id={t_id}: partial, heard (last 20): {response_heard[-20:]!r}")
+                            else:
+                                response_heard = ""
+                                logger.info(f"turn_id={t_id}: nothing heard")
+
+            if target_response_uid is not None and response_heard:
+                logger.info(
+                    f"sync_history: materializing assistant turn from heard audio | turn_id={target_turn_id} response_uid={target_response_uid} "
+                    f"text={response_heard!r}"
+                )
+                self.conversation_history.upsert_assistant_for_response(
+                    target_response_uid, response_heard, interim=False, turn_id=target_turn_id
+                )
+                self.conversation_history.upsert_assistant_for_response(
+                    target_response_uid, response_heard, interim=True, turn_id=target_turn_id
+                )
+                for i in range(len(self.conversation_history.messages) - 1, -1, -1):
+                    msg = self.conversation_history.messages[i]
+                    if msg.get("role") == "assistant" or str(msg.get("role")).lower() == "assistant":
+                        if msg.get("response_uid") == target_response_uid or msg.get("turn_id") == target_turn_id:
+                            self._turn_msg_map[target_turn_id] = msg
+                            break
+
+            if target_response_uid is not None:
+                self.conversation_history.sync_response_after_interruption(
+                    target_response_uid, response_heard, self.update_transcript_for_interruption
+                )
+                self.conversation_history.sync_interim_response_after_interruption(
+                    target_response_uid, response_heard, self.update_transcript_for_interruption
+                )
+            else:
+                self.conversation_history.sync_turn_after_interruption(
+                    target_turn_id, response_heard, self.update_transcript_for_interruption
+                )
+                self.conversation_history.sync_interim_turn_after_interruption(
+                    target_turn_id, response_heard, self.update_transcript_for_interruption
+                )
+            self._set_interruption_hint(response_heard)
+
+        except Exception as e:
+            logger.error(f"sync_history failed: {e}")
+            import traceback
+
+            traceback.print_exc()
+
+    async def __cleanup_downstream_tasks(self):
+        current_ts = time.time()
+        logger.info(f"Cleaning up downstream task")
+        start_time = time.time()
+        self._cancel_in_flight_llm_response()
+        await self.tools["output"].handle_interruption()
+        await self.tools["synthesizer"].handle_interruption()
+
+        # handle_interruption clears the welcome's pending mark; its ACK would
+        # otherwise be the only signal that flips this flag.
+        if not self.tools["input"].welcome_message_played():
+            self.tools["input"].is_welcome_message_played = True
+
+        await self.sync_history(self.mark_event_meta_data.fetch_cleared_mark_event_data().items(), current_ts)
+        self.tools["input"].reset_response_heard_by_user()
+
+        self.interruption_manager.invalidate_pending_responses()
+        self._drop_all_staged_assistant_history("cleanup_downstream_tasks")
+        self.response_in_pipeline = False
+        await self.tools["synthesizer"].flush_synthesizer_stream()
+
+        # Stop the output loop first so that we do not transmit anything else
+        if self.output_task is not None:
+            logger.info(f"Cancelling output task")
+            self.output_task.cancel()
+        self.output_task = None
+
+        if self.llm_task is not None:
+            logger.info(f"Cancelling LLM Task")
+            self.llm_task.cancel()
+            self.llm_task = None
+
+        if self.eager_llm_task is not None:
+            logger.info(f"Cancelling Eager LLM Task")
+            self.eager_llm_task.cancel()
+            self.eager_llm_task = None
+            self.eager_history_snapshot = None
+            self.eager_meta_info = None
+
+        if self.first_message_task is not None:
+            logger.info("Cancelling first message task")
+            self.first_message_task.cancel()
+            self.first_message_task = None
+
+        self.voicemail_handler.cancel_task()
+
+        # self.synthesizer_task.cancel()
+        # self.synthesizer_task = asyncio.create_task(self.__listen_synthesizer())
+        for task in self.synthesizer_tasks:
+            task.cancel()
+        self.synthesizer_tasks = []
+
+        logger.info(f"Synth Task cancelled seconds")
+        if not self.buffered_output_queue.empty():
+            logger.info(f"Output queue was not empty and hence emptying it")
+            self.buffered_output_queue = asyncio.Queue()
+
+        self._turn_audio_flushed.set()
+
+        # restart output task
+        self.output_task = asyncio.create_task(self.__process_output_loop())
+        self.started_transmitting_audio = False  # Since we're interrupting we need to stop transmitting as well
+        self.last_transmitted_timestamp = time.time()
+        # clear_data() normally drops the playout estimate, but it runs after the provider's
+        # clear send and is skipped if that raises, leaving a stale future deadline that would
+        # hold the watchdog off. Drop it here so an interruption always clears it.
+        self.mark_event_meta_data.drop_playout_estimate()
+        logger.info(f"Cleaning up downstream tasks. Time taken to send a clear message {time.time() - start_time}")
+
+    def __get_updated_meta_info(self, meta_info=None):
+        # This is used in case there's silence from callee's side
+        if meta_info is None:
+            meta_info = self.tools["transcriber"].get_meta_info()
+            logger.info(f"Metainfo {meta_info}")
+        meta_info_copy = meta_info.copy()
+
+        new_sequence_id = self.interruption_manager.get_next_sequence_id()
+        meta_info_copy["sequence_id"] = new_sequence_id
+        # Transcript/tool-call grouping needs a response-turn id that is stable
+        # across all chunks and sub-steps of one response chain, but independent
+        # from audio sequencing. sequence_id is for interruption/audio gating;
+        # chunk_id is for chunking; turn_id is for transcript/history grouping.
+        self._response_turn_id += 1
+        meta_info_copy["turn_id"] = self._response_turn_id
+        response_uid = str(uuid.uuid4())
+        meta_info_copy["response_uid"] = response_uid
+        meta_info_copy["response_group_uid"] = response_uid
+        meta_info_copy.pop("parent_response_uid", None)
+        logger.info(
+            "VOX_TRACE_META new_response seq=%s turn=%s response_uid=%s group_uid=%s request_id=%s origin=%s",
+            meta_info_copy.get("sequence_id"),
+            meta_info_copy.get("turn_id"),
+            meta_info_copy.get("response_uid"),
+            meta_info_copy.get("response_group_uid"),
+            meta_info_copy.get("request_id"),
+            meta_info_copy.get("origin"),
+        )
+
+        return meta_info_copy
+
+    def _spawn_followup_meta_info(self, meta_info):
+        followup_meta_info = self.__get_updated_meta_info(meta_info)
+        followup_meta_info["response_group_uid"] = meta_info.get("response_group_uid") or meta_info.get("response_uid")
+        followup_meta_info["parent_response_uid"] = meta_info.get("response_uid")
+        for key in (
+            "chunk_id",
+            "mark_id",
+            "is_first_chunk",
+            "is_first_chunk_of_entire_response",
+            "is_final_chunk_of_entire_response",
+            "end_of_synthesizer_stream",
+            "end_of_llm_stream",
+            "text_synthesized",
+        ):
+            followup_meta_info.pop(key, None)
+        logger.info(
+            "VOX_TRACE_META followup seq=%s turn=%s response_uid=%s group_uid=%s parent_response_uid=%s request_id=%s parent_seq=%s parent_turn=%s",
+            followup_meta_info.get("sequence_id"),
+            followup_meta_info.get("turn_id"),
+            followup_meta_info.get("response_uid"),
+            followup_meta_info.get("response_group_uid"),
+            followup_meta_info.get("parent_response_uid"),
+            followup_meta_info.get("request_id"),
+            meta_info.get("sequence_id"),
+            meta_info.get("turn_id"),
+        )
+        return followup_meta_info
+
+    def _extract_sequence_and_meta(self, message):
+        sequence, meta_info = None, None
+        if isinstance(message, dict) and "meta_info" in message:
+            self._set_call_details(message)
+            meta_info = message["meta_info"]
+            sequence = meta_info.get("sequence", 0)
+        return sequence, meta_info
+
+    def _is_extraction_task(self):
+        return self.task_config["task_type"] == "extraction"
+
+    def _is_summarization_task(self):
+        return self.task_config["task_type"] == "summarization"
+
+    def _is_conversation_task(self):
+        return self.task_config["task_type"] == "conversation"
+
+    def _get_next_step(self, sequence, origin):
+        try:
+            return next(
+                (
+                    self.pipelines[sequence][i + 1]
+                    for i in range(len(self.pipelines[sequence]) - 1)
+                    if self.pipelines[sequence][i] == origin
+                ),
+                "output",
+            )
+        except Exception as e:
+            logger.error(f"Error getting next step: {e}")
+
+    def _set_call_details(self, message):
+        if (
+            self.call_sid is not None
+            and self.stream_sid is not None
+            and "call_sid" not in message["meta_info"]
+            and "stream_sid" not in message["meta_info"]
+        ):
+            return
+
+        if "call_sid" in message.get("meta_info", {}):
+            self.call_sid = message["meta_info"]["call_sid"]
+        if "stream_sid" in message.get("meta_info", {}):
+            self.stream_sid = message["meta_info"]["stream_sid"]
+
+    async def _process_followup_task(self, message=None):
+        if self.task_config["task_type"] == "webhook":
+            logger.info(f"Input patrameters {self.input_parameters}")
+            extraction_details = self.input_parameters.get("extraction_details", {})
+            logger.info(f"DOING THE POST REQUEST TO WEBHOOK {extraction_details}")
+            self.webhook_response = await self.tools["webhook_agent"].execute(extraction_details)
+            logger.info(f"Response from the server {self.webhook_response}")
+        else:
+            message = format_messages(
+                self.input_parameters["messages"], include_tools=True
+            )  # Remove the initial system prompt
+            self.history.append({"role": "user", "content": message})
+
+            start_time = time.time()
+            try:
+                json_data = await self.tools["llm_agent"].generate(self.history)
+            except VoxComponentError:
+                raise
+            except Exception as e:
+                raise LLMError(
+                    str(e), provider=self.llm_config.get("provider"), model=self.llm_config.get("model")
+                ) from e
+            latency_ms = (time.time() - start_time) * 1000
+
+            if self.task_config["task_type"] == "summarization":
+                self.summarized_data = json_data["summary"]
+                self.llm_latencies.other_latencies.append(
+                    {
+                        "type": "summarization",
+                        "latency_ms": latency_ms,
+                        "model": LLM_DEFAULT_CONFIGS["summarization"]["model"],
+                        "provider": LLM_DEFAULT_CONFIGS["summarization"]["provider"],
+                    }
+                )
+            else:
+                json_data = clean_json_string(json_data)
+                if type(json_data) is not dict:
+                    json_data = json.loads(json_data)
+                self.extracted_data = json_data
+                self.llm_latencies.other_latencies.append(
+                    {
+                        "type": "extraction",
+                        "latency_ms": latency_ms,
+                        "model": LLM_DEFAULT_CONFIGS["extraction"]["model"],
+                        "provider": LLM_DEFAULT_CONFIGS["extraction"]["provider"],
+                    }
+                )
+
+    # This observer works only for messages which have sequence_id != -1
+    def final_chunk_played_observer(self, is_final_chunk_played):
+        logger.info(f"Updating last_transmitted_timestamp")
+        self.last_transmitted_timestamp = time.time()
+        # Record actual audio playback end (mark ACK from provider) for agent_end_ms tracking.
+        input_handler = self.tools.get("input")
+        if input_handler is not None:
+            seq_id = getattr(input_handler, "last_final_chunk_sequence_id", None)
+            ts = getattr(input_handler, "last_final_chunk_played_ts", None)
+            if seq_id is not None and ts is not None:
+                self.interruption_manager.on_agent_audio_fully_played(seq_id, ts)
+
+    async def agent_hangup_observer(self, is_agent_hangup):
+        logger.info(f"agent_hangup_observer triggered with is_agent_hangup = {is_agent_hangup}")
+        if is_agent_hangup:
+            self.tools["output"].set_hangup_sent()
+            await self.__process_end_of_conversation()
+
+    async def wait_for_current_message(self):
+        try:
+            await asyncio.wait_for(self._turn_audio_flushed.wait(), timeout=3.0)
+        except asyncio.TimeoutError:
+            logger.warning("wait_for_current_message: synth pipeline flush timed out after 3s")
+
+        entry_time = time.time()
+        while not self.conversation_ended:
+            mark_events = self.mark_event_meta_data.mark_event_meta_data
+            mark_items_list = [{"mark_id": k, "mark_data": v} for k, v in mark_events.items()]
+            logger.info(f"current_list: {mark_items_list}")
+
+            if not mark_items_list:
+                break
+
+            first_item = mark_items_list[0]["mark_data"]
+            if len(mark_items_list) == 1 and first_item.get("type") == "pre_mark_message":
+                break
+
+            # plivo mark_event bug
+            if len(mark_items_list) == 2:
+                second_item = mark_items_list[1]["mark_data"]
+                if (
+                    first_item.get("type") == "agent_hangup"
+                    and first_item.get("text_synthesized") == ""
+                    and second_item.get("type") == "pre_mark_message"
+                ):
+                    break
+
+            if first_item.get("text_synthesized") and first_item.get("is_final_chunk") is True:
+                break
+
+            # Use entry_time (not time.time()) so the deadline is a fixed point in the
+            # future rather than one that recedes with each iteration. Without this,
+            # `remaining = sum(durations) + hangup_mark_event_timeout` never reaches 0
+            # when Plivo stops ACKing marks, causing an indefinite spin.
+            remaining_durations = [
+                v.get("duration", 0)
+                for v in mark_events.values()
+                if v.get("type") != "pre_mark_message" and v.get("sent_ts")
+            ]
+            expected_play_end = (entry_time + sum(remaining_durations)) if remaining_durations else entry_time
+            deadline = expected_play_end + self.hangup_mark_event_timeout
+
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                logger.warning(
+                    f"wait_for_current_message timed out: {len(mark_events)} marks unflushed, "
+                    f"expected_play_end was {expected_play_end - entry_time:.1f}s after entry, "
+                    f"grace {self.hangup_mark_event_timeout}s exceeded"
+                )
+                break
+
+            self.mark_event_meta_data.mark_changed.clear()
+            try:
+                await asyncio.wait_for(self.mark_event_meta_data.mark_changed.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                pass
+        return
+
+    async def inject_typed_messages(self) -> None:
+        """Let a visitor take a turn by typing during a live voice call.
+
+        `queues["llm"]` is only drained for turn-based dashboard sessions, so a
+        typed message put there during a call is never read. This injects it the
+        same way DTMF digits are injected instead — through the transcriber
+        output path, so it gets a real sequence and the agent answers aloud.
+        """
+        transport = self.kwargs.get("transport")
+        if transport is None:
+            return
+
+        try:
+            async for text in transport.typed_messages():
+                logger.info(f"Visitor typed during the call: {text}")
+                base_meta_info = {
+                    "io": self.tools["input"].io_provider,
+                    "type": "text",
+                    "sequence": 0,
+                    "origin": "typed",
+                }
+                meta_info = self.__get_updated_meta_info(base_meta_info)
+                await self._handle_transcriber_output("llm", text, meta_info)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Typed message injection stopped: {e}")
+
+    async def inject_digits_to_conversation(self) -> None:
+        while True:
+            try:
+                dtmf_digits = await self.queues["dtmf"].get()
+                logger.info(f"DTMF collected {dtmf_digits}")
+
+                _dtmf_ts = round(time.time() * 1000 - self.conversation_start_init_ts, 2)
+                for _digit in dtmf_digits:
+                    self.dtmf_events.append({"digit": _digit, "ts_ms": _dtmf_ts})
+
+                dtmf_message = "dtmf_number: " + dtmf_digits
+                base_meta_info = {
+                    "io": self.tools["input"].io_provider,
+                    "type": "text",
+                    "sequence": 0,
+                    "origin": "dtmf",
+                }
+                meta_info = self.__get_updated_meta_info(base_meta_info)
+                await self._handle_transcriber_output("llm", dtmf_message, meta_info)
+                logger.info(f"DTMF LLM processing triggered with sequence_id={meta_info['sequence_id']}")
+            except Exception as e:
+                logger.info(f"DTMF LLM processing triggered with exception {e}")
+
+    async def _listen_events(self):
+        """Listen for external events and process them through the graph agent.
+        Events trigger node transitions and proactive speech without user input."""
+        logger.info("Event listener started for graph agent")
+        while True:
+            try:
+                event = await self.event_queue.get()
+                if self.conversation_ended:
+                    logger.info(f"Event '{event.get('event')}' ignored — conversation ended")
+                    continue
+
+                logger.info(f"Processing external event: {event.get('event')}")
+
+                # Wait for a safe point (no audio playing, no response in pipeline)
+                await self._wait_for_safe_point()
+
+                if self.conversation_ended:
+                    continue
+
+                # Process through graph agent
+                result = self.tools["llm_agent"].process_event(event)
+
+                if result.get("matched"):
+                    # Set node entry index so _node_turns counts from this point
+                    self.tools["llm_agent"].current_node_entry_index = len(self.conversation_history.get_copy())
+
+                    if self.interruption_manager and self.interruption_manager.is_user_speaking():
+                        # User is mid-speech — skip proactive generation.
+                        # The node already transitioned, so the user's in-progress
+                        # utterance will be routed + answered on the new node.
+                        target_node = result.get("target_node")
+                        if target_node:
+                            self.repeat_after_silence_seconds = target_node.get("repeat_after_silence_seconds")
+                        logger.info(
+                            f"Event '{event.get('event')}' transitioned node but user is speaking — deferring to conversation flow"
+                        )
+                    else:
+                        await self._proactive_generate_for_event(event, result)
+                else:
+                    logger.info(f"Event '{event.get('event')}' — no matching edge, context updated silently")
+
+            except asyncio.CancelledError:
+                logger.info("Event listener cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in event listener: {e}")
+                traceback.print_exc()
+
+    async def _wait_for_safe_point(self, timeout=30.0):
+        """Wait until the pipeline is idle: no audio playing, no response in pipeline, no active LLM task."""
+        start = time.time()
+        while time.time() - start < timeout:
+            if self.conversation_ended:
+                return
+            audio_playing = self.tools["input"].is_audio_being_played_to_user() if "input" in self.tools else False
+            llm_busy = self.llm_task is not None and not self.llm_task.done() if self.llm_task else False
+            if not audio_playing and not self.response_in_pipeline and not llm_busy:
+                return
+            await asyncio.sleep(0.1)
+        logger.warning(f"_wait_for_safe_point timed out after {timeout}s")
+
+    async def _proactive_generate_for_event(self, event: dict, result: dict):
+        """Trigger proactive speech generation after an event-driven transition."""
+        node_type = result.get("node_type", NodeType.LLM)
+        target_node = result.get("target_node")
+
+        # Update repeat_after_silence for the new node
+        if target_node:
+            self.repeat_after_silence_seconds = target_node.get("repeat_after_silence_seconds")
+
+        if node_type == NodeType.STATIC:
+            # Static node: play cached audio directly, no LLM cost
+            static_text = (
+                select_message_by_language(target_node.get("static_message"), self.language) if target_node else ""
+            )
+            if static_text:
+                if self.context_data:
+                    static_text = update_prompt_with_context(static_text, self.context_data)
+                self.conversation_history.append_assistant(static_text)
+                meta_info = {
+                    "io": self.tools["output"].get_provider(),
+                    "request_id": str(uuid.uuid4()),
+                    "cached": True,
+                    "sequence_id": -1,
+                    "format": self.task_config["tools_config"]["output"].get("format", "pcm"),
+                    "end_of_llm_stream": True,
+                    "text": static_text,
+                    "message_category": "event_proactive",
+                }
+                ws_packet = create_ws_data_packet(get_md5_hash(static_text), meta_info=meta_info, is_md5_hash=True)
+                await self._synthesize(ws_packet)
+        else:
+            # LLM node: set flag and trigger generation without adding a user message
+            self.tools["llm_agent"]._event_triggered_generation = True
+            self.tools["llm_agent"].context_data["_event_previous_node"] = result.get("previous_node", "")
+            await self._generate_proactive()
+
+    async def _generate_proactive(self):
+        meta_info = self.__get_updated_meta_info(
+            {
+                "io": self.tools["output"].get_provider(),
+                "request_id": str(uuid.uuid4()),
+                "cached": False,
+                "format": self.task_config["tools_config"]["output"].get("format", "pcm"),
+                "message_category": "event_proactive",
+            }
+        )
+        self.response_in_pipeline = True
+        task = asyncio.create_task(self._run_llm_task(create_ws_data_packet("", meta_info)))
+        self.llm_task = task
+        try:
+            await task
+        except asyncio.CancelledError:
+            logger.info("Proactive generation cancelled by interruption")
+            return
+
+    async def __process_end_of_conversation(self, web_call_timeout=False):
+        if self._end_of_conversation_in_progress or self.conversation_ended:
+            logger.info("__process_end_of_conversation: Already in progress or ended, skipping duplicate call")
+            return
+
+        self._end_of_conversation_in_progress = True
+        logger.info("Got end of conversation. I'm stopping now")
+
+        await self.wait_for_current_message()
+
+        # Check completion of agent_hangup_message sent from output
+        # Only wait for hangup chunk if a hangup message was actually queued
+        while self.hangup_triggered and self.hangup_message_queued:
+            try:
+                if self.tools["output"].hangup_sent():
+                    logger.info("final hangup chunk is now sent. Breaking now")
+                    break
+                else:
+                    logger.info("final hangup chunk has not been sent yet")
+                    await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.error(f"Error while checking queue: {e}", exc_info=True)
+                break
+
+        if self.hangup_message_queued and not web_call_timeout:
+            self.history.append({"role": "assistant", "content": self.call_hangup_message})
+
+        self.conversation_ended = True
+        self.ended_by_assistant = True
+
+        # Cancel any running LLM / function-call tasks so they don't add
+        # phantom responses to the transcript after the call has ended.
+        if self.llm_task is not None and not self.llm_task.done():
+            logger.info("__process_end_of_conversation: Cancelling LLM task")
+            self.llm_task.cancel()
+            self.llm_task = None
+
+        # Turn-based chat clears its spinner only on the <end_of_stream> marker. When the
+        # conversation ends mid-turn, close() below would drop it, so flush it first.
+        if self.turn_based_conversation and "output" in self.tools and self.tools["output"] is not None:
+            try:
+                eos_meta_info = {"type": "text", "sequence_id": -1, "request_id": str(uuid.uuid4())}
+                await self.tools["output"].handle(create_ws_data_packet("<end_of_stream>", eos_meta_info))
+            except Exception as e:
+                logger.warning(f"Failed to flush end_of_stream marker before closing chat output handler: {e}")
+
+        # Close output handler to prevent sends after websocket close
+        if "output" in self.tools and self.tools["output"] is not None:
+            self.tools["output"].close()
+
+        await self.tools["input"].stop_handler()
+        logger.info("Stopped input handler")
+        if "transcriber" in self.tools and not self.turn_based_conversation:
+            logger.info("Stopping transcriber")
+            await self.tools["transcriber"].toggle_connection()
+            await asyncio.sleep(2)  # Making sure whatever message was passed is over
+
+        self.voicemail_handler.cancel_task()
+
+    def __update_preprocessed_tree_node(self):
+        logger.info(f"It's a preprocessed flow and hence updating current node")
+        self.tools["llm_agent"].update_current_node()
+
+    ##############################################################
+    # LLM task
+    ##############################################################
+    async def _handle_llm_output(
+        self, next_step, text_chunk, should_bypass_synth, meta_info, is_filler=False, is_function_call=False
+    ):
+        if "request_id" not in meta_info:
+            meta_info["request_id"] = str(uuid.uuid4())
+
+        if not self.stream and not is_filler:
+            first_buffer_latency = time.time() - meta_info["llm_start_time"]
+            meta_info["llm_first_buffer_generation_latency"] = first_buffer_latency
+
+        elif is_filler:
+            logger.info(f"It's a filler message and hence adding required metadata")
+            meta_info["origin"] = "classifier"
+            meta_info["cached"] = True
+            meta_info["local"] = True
+            meta_info["message_category"] = "filler"
+
+        if next_step == "synthesizer" and not should_bypass_synth:
+            if not text_chunk or not text_chunk.strip():
+                return
+            self._turn_audio_flushed.clear()
+            task = asyncio.create_task(self._synthesize(create_ws_data_packet(text_chunk, meta_info)))
+            self.synthesizer_tasks.append(asyncio.ensure_future(task))
+        elif self.tools["output"] is not None:
+            logger.info("Synthesizer not the next step and hence simply returning back")
+            overall_time = time.time() - meta_info["llm_start_time"]
+            # self.history = copy.deepcopy(self.interim_history)
+            if is_function_call:
+                bos_packet = create_ws_data_packet("<beginning_of_stream>", meta_info)
+                await self.tools["output"].handle(bos_packet)
+                await self.tools["output"].handle(create_ws_data_packet(text_chunk, meta_info))
+                eos_packet = create_ws_data_packet("<end_of_stream>", meta_info)
+                await self.tools["output"].handle(eos_packet)
+            else:
+                await self.tools["output"].handle(create_ws_data_packet(text_chunk, meta_info))
+
+    async def _process_conversation_preprocessed_task(self, message, sequence, meta_info):
+        if self.task_config["tools_config"]["llm_agent"]["agent_flow_type"] == "preprocessed":
+            messages = self.conversation_history.get_copy()
+            # TODO revisit this
+            messages.append({"role": "user", "content": message["data"]})
+            logger.info(f"Starting LLM Agent {messages}")
+            # Expose get current classification_response method from the agent class and use it for the response log
+            convert_to_request_log(
+                message=format_messages(messages, use_system_prompt=True),
+                meta_info=meta_info,
+                component=LogComponent.LLM,
+                direction=LogDirection.REQUEST,
+                model=self.llm_agent_config["model"],
+                is_cached=True,
+                run_id=self.run_id,
+            )
+            async for next_state in self.tools["llm_agent"].generate(messages, label_flow=self.label_flow):
+                if next_state == "<end_of_conversation>":
+                    meta_info["end_of_conversation"] = True
+                    self.buffered_output_queue.put_nowait(create_ws_data_packet("<end_of_conversation>", meta_info))
+                    return
+
+                logger.info(f"Text chunk {next_state['text']}")
+                # TODO revisit this
+                messages.append({"role": "assistant", "content": next_state["text"]})
+                self.synthesizer_tasks.append(
+                    asyncio.create_task(
+                        self._synthesize(create_ws_data_packet(next_state["audio"], meta_info, is_md5_hash=True))
+                    )
+                )
+            logger.info(f"Interim history after the LLM task {messages}")
+            self.llm_response_generated = True
+            self.conversation_history.sync_interim(messages)
+
+    async def _process_conversation_formulaic_task(self, message, sequence, meta_info):
+        llm_response = ""
+        logger.info("Agent flow is formulaic and hence moving smoothly")
+        async for text_chunk in self.tools["llm_agent"].generate(self.history):
+            if is_valid_md5(text_chunk):
+                self.synthesizer_tasks.append(
+                    asyncio.create_task(
+                        self._synthesize(create_ws_data_packet(text_chunk, meta_info, is_md5_hash=True))
+                    )
+                )
+            else:
+                # TODO Make it more modular
+                llm_response += " " + text_chunk
+                next_step = self._get_next_step(sequence, "llm")
+                if next_step == "synthesizer":
+                    self.synthesizer_tasks.append(
+                        asyncio.create_task(self._synthesize(create_ws_data_packet(text_chunk, meta_info)))
+                    )
+                else:
+                    logger.info(f"Sending output text {sequence}")
+                    await self.tools["output"].handle(create_ws_data_packet(text_chunk, meta_info))
+                    self.synthesizer_tasks.append(
+                        asyncio.create_task(
+                            self._synthesize(create_ws_data_packet(text_chunk, meta_info, is_md5_hash=False))
+                        )
+                    )
+
+    async def __execute_function_call(
+        self, url, method, param, api_token, headers, model_args, meta_info, next_step, called_fun, **resp
+    ):
+        self.check_if_user_online = False
+        function_call_log = None
+        turn_id = meta_info.get("turn_id")
+        response_uid = meta_info.get("response_uid")
+
+        if "execution_id" in resp and resp["execution_id"] != self.run_id:
+            logger.warning(f"Correcting LLM-generated execution_id: '{resp['execution_id']}' -> '{self.run_id}'")
+            resp["execution_id"] = self.run_id
+
+        if called_fun.startswith(END_CALL_FUNCTION_PREFIX):
+            # Lock out barge-in before the goodbye is generated, otherwise an interruption
+            # cancels the turn task and the disconnect never runs.
+            self._end_call_in_progress = True
+            reason = resp.get("reason", "")
+
+            logger.info(f"end_call tool invoked, reason: {reason}")
+            convert_to_request_log(
+                json.dumps({"called_fun": called_fun, "reason": reason}),
+                meta_info,
+                None,
+                "function_call",
+                direction="request",
+                run_id=self.run_id,
+            )
+
+            textual_response = resp.get("textual_response", None)
+            tool_result = json.dumps(
+                {"status": "success", "message": "Call is ending now. Say a brief goodbye to the user."}
+            )
+            self.conversation_history.attach_tool_calls_to_turn(turn_id, resp["model_response"])
+            self.conversation_history.append_tool_result(resp.get("tool_call_id", ""), tool_result)
+            convert_to_request_log(
+                tool_result, meta_info, None, "function_call", direction="response", run_id=self.run_id
+            )
+
+            if textual_response:
+                # The LLM emitted the goodbye in the same response as the tool call;
+                # it has already been streamed to TTS. Skip the follow-up LLM to avoid
+                # generating a duplicate goodbye.
+                self._enter_hangup_state()
+                await self.wait_for_current_message()
+            else:
+                # No goodbye text in this turn. Feed the tool result back so the LLM
+                # generates one.
+                messages = self.conversation_history.get_copy()
+                convert_to_request_log(
+                    format_messages(messages, True),
+                    meta_info,
+                    self.llm_config["model"],
+                    "llm",
+                    direction="request",
+                    run_id=self.run_id,
+                )
+
+                followup_meta_info = self._spawn_followup_meta_info(meta_info)
+                await self.__do_llm_generation(
+                    messages, followup_meta_info, next_step, should_trigger_function_call=False
+                )
+                self._enter_hangup_state()
+                await self.wait_for_current_message()
+
+            self.hangup_detail = HangupReason.END_CALL_TOOL
+            self.call_hangup_message_config = None
+            await self.process_call_hangup()
+            return
+
+        if called_fun.startswith("transfer_call"):
+            # A transfer hands the call off at the telephony layer, but the bot's media
+            # leg can stay connected (e.g. VoBiz redirect). The caller often keeps talking
+            # ("hello?") while the transfer connects, producing fresh LLM turns that re-emit
+            # this tool. Because the transfer branch returns early it never recorded the
+            # tool call/result in conversation history (unlike the end_call and normal API
+            # paths), so the LLM had no memory it already transferred and looped — firing
+            # process_transfer repeatedly until the call dropped. Guard on has_transfer so
+            # the transfer fires exactly once; record the result so the LLM stops re-triggering.
+            if self.has_transfer:
+                logger.info(f"transfer_call already initiated for run_id={self.run_id}; ignoring duplicate trigger")
+                duplicate_tool_result = json.dumps(
+                    {
+                        "status": "success",
+                        "message": "Call transfer already in progress. Wait silently for the user to be connected; do not transfer again.",
+                    }
+                )
+                self.conversation_history.attach_tool_calls_to_turn(turn_id, resp["model_response"])
+                self.conversation_history.append_tool_result(resp.get("tool_call_id", ""), duplicate_tool_result)
+                return
+
+            self.has_transfer = True
+            # Record the transfer in conversation history so the LLM knows it has already
+            # handed the call off and will not re-trigger on the next turn. Recorded here
+            # (before the POST) because an exception from the webhook usually means the call
+            # was already redirected — see the "call likely redirected" handler below.
+            self.conversation_history.attach_tool_calls_to_turn(turn_id, resp["model_response"])
+            self.conversation_history.append_tool_result(
+                resp.get("tool_call_id", ""),
+                json.dumps(
+                    {
+                        "status": "success",
+                        "message": "Call transfer initiated. Wait silently for the user to be connected; do not transfer again.",
+                    }
+                ),
+            )
+            # Transfer returns early, so fire the pre-call webhook here (before the POST).
+            tool_conf = self.kwargs.get("api_tools", {}).get("tools_params", {}).get(called_fun, {})
+            transfer_pre_call_webhook_url = tool_conf.get("pre_call_webhook_url")
+            if transfer_pre_call_webhook_url:
+                # call_transfer_number is config, not an LLM arg — inject it for the template.
+                webhook_resp = dict(resp)
+                try:
+                    transfer_param = json.loads(param) if isinstance(param, str) else (param or {})
+                    if transfer_param.get("call_transfer_number"):
+                        webhook_resp.setdefault("call_transfer_number", transfer_param["call_transfer_number"])
+                except Exception as exc:
+                    logger.warning(f"could not extract call_transfer_number for pre_call_webhook: {exc}")
+                self.fire_pre_call_webhook(
+                    transfer_pre_call_webhook_url,
+                    called_fun,
+                    webhook_resp,
+                    meta_info,
+                    tool_conf.get("pre_call_webhook_param"),
+                )
+            await asyncio.sleep(2)
+            try:
+                from_number = self.context_data["recipient_data"]["from_number"]
+            except Exception as e:
+                from_number = None
+
+            call_sid = None
+            call_transfer_number = None
+            payload = {
+                "call_sid": call_sid,
+                "provider": self.tools["input"].io_provider,
+                "stream_sid": self.stream_sid,
+                "from_number": from_number,
+                "execution_id": self.run_id,
+                **(self.transfer_call_params or {}),
+            }
+
+            if self.tools["input"].io_provider != "default":
+                call_sid = self.tools["input"].get_call_sid()
+                payload["call_sid"] = call_sid
+
+            if url is None:
+                url = os.getenv("CALL_TRANSFER_WEBHOOK_URL")
+
+                try:
+                    json_function_call_params = copy.deepcopy(param)
+                    if isinstance(param, str):
+                        json_function_call_params = json.loads(param)
+                    call_transfer_number = json_function_call_params["call_transfer_number"]
+                    if call_transfer_number:
+                        payload["call_transfer_number"] = call_transfer_number
+                except Exception as e:
+                    logger.error(f"Error in __execute_function_call {e}")
+
+            if param is not None:
+                logger.info(f"Gotten response {resp}")
+                payload = {**payload, **resp}
+
+            if self.tools["input"].io_provider != "default":
+                payload["call_sid"] = self.tools["input"].get_call_sid()
+
+            self.transfer_call_events.append(
+                {
+                    "type": "transfer_start",
+                    "ts_ms": round(time.time() * 1000 - self.conversation_start_init_ts, 2),
+                    "tool_name": called_fun,
+                    "tool_call_id": resp.get("tool_call_id", ""),
+                    "turn_id": meta_info.get("turn_id"),
+                    "sequence_id": meta_info.get("sequence_id"),
+                    "transfer_number": payload.get("call_transfer_number"),
+                    "provider": self.tools["input"].io_provider,
+                }
+            )
+
+            if self.tools["input"].io_provider == "default":
+                mock_response = (
+                    f"This is a mocked response demonstrating a successful transfer of call to {call_transfer_number}"
+                )
+                function_call_log = self._start_api_call_detail(
+                    called_fun=called_fun,
+                    url=url,
+                    method="POST",
+                    param=param,
+                    headers={"Content-Type": "application/json"},
+                    meta_info=meta_info,
+                    runtime_args={
+                        **self._extract_api_call_runtime_args(resp),
+                        "tool_call_id": resp.get("tool_call_id", ""),
+                    },
+                    request_body=payload,
+                    api_params=payload,
+                )
+                convert_to_request_log(
+                    str(payload),
+                    meta_info,
+                    None,
+                    LogComponent.FUNCTION_CALL,
+                    direction=LogDirection.REQUEST,
+                    run_id=self.run_id,
+                )
+                convert_to_request_log(
+                    mock_response,
+                    meta_info,
+                    None,
+                    LogComponent.FUNCTION_CALL,
+                    direction=LogDirection.RESPONSE,
+                    run_id=self.run_id,
+                )
+                self._finalize_api_call_detail(
+                    function_call_log, response=mock_response, status_code=200, content_type="text/plain"
+                )
+                self.transfer_call_events.append(
+                    {
+                        "type": "transfer_end",
+                        "ts_ms": round(time.time() * 1000 - self.conversation_start_init_ts, 2),
+                        "tool_call_id": resp.get("tool_call_id", ""),
+                        "turn_id": meta_info.get("turn_id"),
+                        "sequence_id": meta_info.get("sequence_id"),
+                        "status_code": 200,
+                        "latency_ms": function_call_log.get("latency_ms"),
+                        "success": True,
+                    }
+                )
+
+                bos_packet = create_ws_data_packet("<beginning_of_stream>", meta_info)
+                await self.tools["output"].handle(bos_packet)
+                await self.tools["output"].handle(create_ws_data_packet(mock_response, meta_info))
+                eos_packet = create_ws_data_packet("<end_of_stream>", meta_info)
+                await self.tools["output"].handle(eos_packet)
+                return
+
+            async with aiohttp.ClientSession() as session:
+                logger.info(f"Sending the payload to stop the conversation {payload} url {url}")
+                while self.tools["input"].is_audio_being_played_to_user():
+                    await asyncio.sleep(1)
+                function_call_log = self._start_api_call_detail(
+                    called_fun=called_fun,
+                    url=url,
+                    method="POST",
+                    param=param,
+                    headers={"Content-Type": "application/json"},
+                    meta_info=meta_info,
+                    runtime_args={
+                        **self._extract_api_call_runtime_args(resp),
+                        "tool_call_id": resp.get("tool_call_id", ""),
+                    },
+                    request_body=payload,
+                    api_params=payload,
+                )
+                convert_to_request_log(
+                    str(payload),
+                    meta_info,
+                    None,
+                    LogComponent.FUNCTION_CALL,
+                    direction=LogDirection.REQUEST,
+                    is_cached=False,
+                    run_id=self.run_id,
+                )
+                _transfer_end_recorded = False
+                try:
+                    async with session.post(url, json=payload) as response:
+                        response_text = await response.text()
+                        logger.info(f"Response from the server after call transfer: {response_text}")
+                        convert_to_request_log(
+                            str(response_text),
+                            meta_info,
+                            None,
+                            LogComponent.FUNCTION_CALL,
+                            direction=LogDirection.RESPONSE,
+                            is_cached=False,
+                            run_id=self.run_id,
+                        )
+                        self._finalize_api_call_detail(
+                            function_call_log,
+                            response=response_text,
+                            status_code=response.status,
+                            content_type=response.headers.get("Content-Type"),
+                        )
+                        self.transfer_call_events.append(
+                            {
+                                "type": "transfer_end",
+                                "ts_ms": round(time.time() * 1000 - self.conversation_start_init_ts, 2),
+                                "tool_call_id": resp.get("tool_call_id", ""),
+                                "turn_id": meta_info.get("turn_id"),
+                                "sequence_id": meta_info.get("sequence_id"),
+                                "status_code": response.status,
+                                "latency_ms": function_call_log.get("latency_ms"),
+                                "success": response.status < 400,
+                            }
+                        )
+                        _transfer_end_recorded = True
+                except Exception as transfer_exc:
+                    logger.warning(f"Transfer webhook did not respond (call likely redirected): {transfer_exc}")
+                    self._finalize_api_call_detail(function_call_log, error=transfer_exc)
+                    self.transfer_call_events.append(
+                        {
+                            "type": "transfer_end",
+                            "ts_ms": round(time.time() * 1000 - self.conversation_start_init_ts, 2),
+                            "tool_call_id": resp.get("tool_call_id", ""),
+                            "turn_id": meta_info.get("turn_id"),
+                            "sequence_id": meta_info.get("sequence_id"),
+                            "status_code": None,
+                            "latency_ms": function_call_log.get("latency_ms"),
+                            "success": None,
+                        }
+                    )
+                    _transfer_end_recorded = True
+                finally:
+                    # CancelledError (BaseException) bypasses except — ensure transfer_end is
+                    # always recorded so it appears in progression_data even if the task is
+                    # cancelled mid-flight when Plivo terminates the call.
+                    if not _transfer_end_recorded:
+                        self._finalize_api_call_detail(function_call_log, error="cancelled")
+                        self.transfer_call_events.append(
+                            {
+                                "type": "transfer_end",
+                                "ts_ms": round(time.time() * 1000 - self.conversation_start_init_ts, 2),
+                                "tool_call_id": resp.get("tool_call_id", ""),
+                                "turn_id": meta_info.get("turn_id"),
+                                "sequence_id": meta_info.get("sequence_id"),
+                                "status_code": None,
+                                "latency_ms": function_call_log.get("latency_ms"),
+                                "success": None,
+                            }
+                        )
+                return
+
+        # switch_language tool handler (injected in BOTH flows): waits for in-flight
+        if called_fun == "switch_language":
+            language_label = resp.get("language", "")
+
+            # If the requested language is already active, skip handoff and switch entirely
+            if language_label == self.language:
+                logger.info(
+                    f"switch_language: '{language_label}' is already the active language, skipping handoff and switch"
+                )
+                function_response = f"Already speaking in {language_label}, no switch needed"
+
+                self.conversation_history.attach_tool_calls_to_turn(turn_id, resp["model_response"])
+                self.conversation_history.append_tool_result(resp.get("tool_call_id", ""), function_response)
+                convert_to_request_log(
+                    function_response, meta_info, None, "function_call", direction="response", run_id=self.run_id
+                )
+
+                messages = self.conversation_history.get_copy()
+                followup_meta_info = self._spawn_followup_meta_info(meta_info)
+                await self.__do_llm_generation(
+                    messages,
+                    followup_meta_info,
+                    next_step,
+                    should_bypass_synth=False,
+                    should_trigger_function_call=True,
+                )
+                self.execute_function_call_task = None
+                return
+
+            # Explicit caller request via the main LLM — trusted, so no detector gates. But
+            # bail if the call is ending, else the handoff synthesizes over the queued goodbye.
+            if self.hangup_triggered or self.conversation_ended:
+                function_response = f"Call ending — not switching to {language_label}"
+            elif language_label == self.language:
+                function_response = f"Already speaking in {language_label}, no switch needed"
+            elif self.language_switcher is not None:
+                # NEW flow: playback wait stays OUTSIDE the lock; only the flip is
+                # serialized with the LID decide, so a queued decide isn't stalled for seconds.
+                if not self._turn_audio_flushed.is_set():
+                    await self.wait_for_current_message()
+
+                switched = False
+                async with self.language_switch_lock:
+                    if language_label == self.language:
+                        # A concurrent decide switched to the same target while we waited.
+                        function_response = f"Already speaking in {language_label}, no switch needed"
+                    else:
+                        try:
+                            await self.switch_language(language_label)
+                            switched = True
+                            function_response = f"Switched to {language_label}"
+                            if isinstance(self.tools.get("transcriber"), TranscriberPool):
+                                self.tools["transcriber"].take_lid_transcript()  # drop pre-switch detector buffer
+                        except ValueError as e:
+                            function_response = f"Failed to switch language: {e}"
+                if switched:
+                    # Target-language handoff on the NEW voice (prewarmed clip when available)
+                    # — same as the LID path, so both switch mechanisms sound identical.
+                    await self.__play_switch_handoff(language_label)
+            else:
+                # LEGACY flow (master behavior): source-language handoff on the CURRENT
+                # voice, then switch.
+                if not self._turn_audio_flushed.is_set():
+                    await self.wait_for_current_message()
+
+                handoff_template = self.switch_handoff_messages.get(self.language, "")
+                if handoff_template:
+                    target_agent_name = self._get_voice_name_for_label(language_label)
+                    language_display = LANGUAGE_NAMES.get(language_label, language_label)
+                    handoff_text = handoff_template.replace("{agent_name}", target_agent_name).replace(
+                        "{language}", language_display
+                    )
+                    meta_info_handoff = {
+                        "io": self.tools["output"].get_provider(),
+                        "request_id": str(uuid.uuid4()),
+                        "cached": False,
+                        "sequence_id": -1,
+                        "format": "pcm",
+                        "message_category": "handoff",
+                        "end_of_llm_stream": True,
+                        "text": handoff_text,
+                    }
+                    self._turn_audio_flushed.clear()
+                    await self._synthesize(create_ws_data_packet(handoff_text, meta_info=meta_info_handoff))
+                    await self.wait_for_current_message()
+                    self.conversation_history.append_assistant(handoff_text, turn_id=turn_id, response_uid=response_uid)
+                    if turn_id is not None:
+                        self._turn_msg_map[turn_id] = self.conversation_history.messages[-1]
+
+                try:
+                    await self.switch_language(language_label)
+                    function_response = f"Switched to {language_label}"
+                except ValueError as e:
+                    function_response = f"Failed to switch language: {e}"
+
+            self.check_if_user_online = self.conversation_config.get("check_if_user_online", True)
+            self.conversation_history.attach_tool_calls_to_turn(turn_id, resp["model_response"])
+            self.conversation_history.append_tool_result(resp.get("tool_call_id", ""), function_response)
+            convert_to_request_log(
+                function_response, meta_info, None, "function_call", direction="response", run_id=self.run_id
+            )
+
+            messages = self.conversation_history.get_copy()
+            followup_meta_info = self._spawn_followup_meta_info(meta_info)
+            await self.__do_llm_generation(
+                messages, followup_meta_info, next_step, should_bypass_synth=False, should_trigger_function_call=True
+            )
+            self.execute_function_call_task = None
+            return
+
+        await self.wait_for_current_message()
+
+        if self.hangup_triggered or self.conversation_ended:
+            logger.info(
+                f"__execute_function_call: Aborting before API call — hangup_triggered={self.hangup_triggered}, conversation_ended={self.conversation_ended}"
+            )
+            return
+
+        # Optional pre-call webhook: notify an external system before the tool's main
+        # request runs (e.g. a transfer reason before a custom transfer POST). Fired
+        # fire-and-forget so a webhook outage never blocks or delays the main call.
+        tool_conf = self.kwargs.get("api_tools", {}).get("tools_params", {}).get(called_fun, {})
+        pre_call_webhook_url = tool_conf.get("pre_call_webhook_url")
+        if pre_call_webhook_url:
+            self.fire_pre_call_webhook(
+                pre_call_webhook_url, called_fun, resp, meta_info, tool_conf.get("pre_call_webhook_param")
+            )
+            # Give the fire-and-forget dispatch a head start so the pre-call webhook
+            # reaches the backend before the tool's main request proceeds.
+            await asyncio.sleep(0.3)
+
+        runtime_args = self._extract_api_call_runtime_args(resp)
+        try:
+            prepared_request = prepare_api_request(param, api_token, headers, **runtime_args)
+        except Exception as exc:
+            logger.warning(f"Could not prepare structured function call request for logging: {exc}")
+            prepared_request = {
+                "request_body": None,
+                "api_params": None,
+                "headers": headers,
+            }
+        function_call_log = self._start_api_call_detail(
+            called_fun=called_fun,
+            url=url,
+            method=method,
+            param=param,
+            headers=prepared_request["headers"],
+            meta_info=meta_info,
+            runtime_args=runtime_args,
+            request_body=prepared_request["request_body"],
+            api_params=prepared_request["api_params"],
+        )
+        try:
+            response = await trigger_api(
+                url=url,
+                method=method.lower(),
+                param=param,
+                api_token=api_token,
+                headers_data=headers,
+                meta_info=meta_info,
+                run_id=self.run_id,
+                return_response_metadata=True,
+                # Present only for client-fulfilled (client-rpc://) tools; the
+                # HTTP path ignores it.
+                transport=self.kwargs.get("transport"),
+                **resp,
+            )
+        except asyncio.CancelledError:
+            self._finalize_api_call_detail(function_call_log, error="cancelled")
+            raise
+        self._finalize_api_call_detail(
+            function_call_log,
+            response=response.get("body"),
+            status_code=response.get("status_code"),
+            content_type=response.get("content_type"),
+            error=response.get("error"),
+        )
+        function_response = str(response.get("body"))
+        get_res_keys, get_res_values = await computed_api_response(function_response)
+
+        # Merge API response data into context_data for routing decisions
+        if self.__is_graph_agent():
+            try:
+                response_data = (
+                    json.loads(function_response) if isinstance(function_response, str) else function_response
+                )
+                if isinstance(response_data, dict):
+                    # Update task manager's context_data
+                    if self.context_data is None:
+                        self.context_data = {}
+                    self.context_data.update(response_data)
+                    # Update graph agent's context_data for routing
+                    if hasattr(self.tools.get("llm_agent"), "context_data"):
+                        self.tools["llm_agent"].context_data.update(response_data)
+                    logger.info(f"Merged API response into context_data: {list(response_data.keys())}")
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.debug(f"Could not parse API response as JSON for context merge: {e}")
+        if called_fun.startswith("check_availability_of_slots") and (
+            not get_res_values or (len(get_res_values) == 1 and len(get_res_values[0]) == 0)
+        ):
+            set_response_prompt = []
+        elif called_fun.startswith("book_appointment") and "id" not in get_res_keys:
+            if get_res_values and get_res_values[0] == "no_available_users_found_error":
+                function_response = "Sorry, the host isn't available at this time. Are you available at any other time?"
+            set_response_prompt = []
+        else:
+            set_response_prompt = function_response
+
+        textual_response = resp.get("textual_response", None)
+        self.conversation_history.attach_tool_calls_to_turn(turn_id, resp["model_response"])
+        self.conversation_history.append_tool_result(resp.get("tool_call_id", ""), function_response)
+
+        logger.info(f"Logging function call parameters ")
+        convert_to_request_log(
+            function_response,
+            meta_info,
+            None,
+            LogComponent.FUNCTION_CALL,
+            direction=LogDirection.RESPONSE,
+            is_cached=False,
+            run_id=self.run_id,
+        )
+
+        messages = self.conversation_history.get_copy()
+        convert_to_request_log(
+            format_messages(messages, use_system_prompt=True, include_tools=True),
+            meta_info,
+            self.llm_config["model"],
+            LogComponent.LLM,
+            direction=LogDirection.REQUEST,
+            is_cached=False,
+            run_id=self.run_id,
+        )
+        self.check_if_user_online = self.conversation_config.get("check_if_user_online", True)
+
+        if not called_fun.startswith("transfer_call"):
+            should_bypass_synth = meta_info.get("bypass_synth", False)
+        followup_meta_info = self._spawn_followup_meta_info(meta_info)
+        await self.__do_llm_generation(
+            messages,
+            followup_meta_info,
+            next_step,
+            should_bypass_synth=should_bypass_synth,
+            should_trigger_function_call=True,
+        )
+
+        self.execute_function_call_task = None
+
+    def __store_into_history(
+        self,
+        meta_info,
+        messages,
+        llm_response,
+        should_trigger_function_call=False,
+        input_tokens=None,
+        output_tokens=None,
+        reasoning_tokens=None,
+        cached_tokens=None,
+        reasoning_content=None,
+    ):
+        self.llm_response_generated = True
+        # task 0 only, so aux LLMs (hangup/voicemail) never tally. Report input/output/cached so the
+        # consumer can compute normalized load (cached is exempt, output is weighted).
+        if self.task_id == 0 and self.on_turn_usage and input_tokens:
+            _usage_task = asyncio.create_task(self.on_turn_usage(input_tokens, output_tokens, cached_tokens))
+            self._usage_tasks.add(_usage_task)
+            _usage_task.add_done_callback(self._usage_tasks.discard)
+        convert_to_request_log(
+            message=llm_response,
+            meta_info=meta_info,
+            component=LogComponent.LLM,
+            direction=LogDirection.RESPONSE,
+            model=self.llm_config["model"],
+            run_id=self.run_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            reasoning_tokens=reasoning_tokens,
+            cached_tokens=cached_tokens,
+            reasoning_content=reasoning_content,
+        )
+        turn_id = meta_info.get("turn_id")
+        response_uid = meta_info.get("response_uid")
+        if should_trigger_function_call:
+            logger.info(f"There was a function call and need to make that work")
+            self._stage_assistant_history(meta_info, llm_response)
+        else:
+            messages.append(
+                {"role": "assistant", "content": llm_response, "turn_id": turn_id, "response_uid": response_uid}
+            )
+            self._stage_assistant_history(meta_info, llm_response)
+            self.conversation_history.sync_interim(messages)
+
+    async def __do_llm_generation(
+        self, messages, meta_info, next_step, should_bypass_synth=False, should_trigger_function_call=False
+    ):
+        if self.hangup_triggered or self.conversation_ended:
+            logger.info(
+                f"__do_llm_generation: Skipping — hangup_triggered={self.hangup_triggered}, conversation_ended={self.conversation_ended}"
+            )
+            return
+
+        # Clear stale end_of_llm_stream from previous generation so only
+        # the final chunk of THIS generation carries the flag.
+        meta_info.pop("end_of_llm_stream", None)
+
+        # Reset response tracking for new turn
+        self.tools["input"].reset_response_heard_by_user()
+
+        llm_response, function_tool, function_tool_message = "", "", ""
+        actual_input_tokens, actual_output_tokens, actual_reasoning_tokens, actual_cached_tokens = (
+            None,
+            None,
+            None,
+            None,
+        )
+        actual_reasoning_content = None
+        synthesize = True
+        if should_bypass_synth:
+            synthesize = False
+
+        # Inject language instruction if detection complete
+        messages = self._inject_language_instruction(messages)
+        messages = await self._inject_retrieved_context(messages)
+
+        # Pass detected language to LLM for pre_call_message selection
+        meta_info["detected_language"] = self.language
+
+        try:
+            async for llm_message in self.tools["llm_agent"].generate(
+                messages, synthesize=synthesize, meta_info=meta_info
+            ):
+                if (
+                    isinstance(llm_message, dict) and "messages" in llm_message
+                ):  # custom list of messages before the llm call
+                    convert_to_request_log(
+                        format_messages(llm_message["messages"], use_system_prompt=True, include_tools=True),
+                        meta_info,
+                        self.llm_config["model"],
+                        LogComponent.LLM,
+                        direction=LogDirection.REQUEST,
+                        is_cached=False,
+                        run_id=self.run_id,
+                    )
+                    continue
+
+                # Handle graph agent routing info
+                if isinstance(llm_message, dict) and "routing_info" in llm_message:
+                    routing_info = llm_message["routing_info"]
+
+                    # Log routing request with tools
+                    routing_messages = routing_info.get("routing_messages")
+                    routing_tools = routing_info.get("routing_tools", [])
+                    if routing_messages:
+                        # Format tools for logging (show full descriptions with conditions)
+                        tools_summary = ""
+                        if routing_tools:
+                            tool_lines = []
+                            for t in routing_tools:
+                                if "function" in t:
+                                    name = t["function"]["name"]
+                                    desc = t["function"].get("description", "")
+                                    tool_lines.append(f"  - {name}: {desc}")
+                            if tool_lines:
+                                tools_summary = "\n\nAvailable transitions:\n" + "\n".join(tool_lines)
+
+                        convert_to_request_log(
+                            message=format_messages(routing_messages, use_system_prompt=True) + tools_summary,
+                            meta_info=meta_info,
+                            model=routing_info.get("routing_model", ""),
+                            component=LogComponent.GRAPH_ROUTING,
+                            direction=LogDirection.REQUEST,
+                            run_id=self.run_id,
+                        )
+                    elif routing_info.get("routing_type") == "deterministic":
+                        expression_trace = (
+                            routing_info.get("routing_expression") or routing_info.get("reasoning") or "matched"
+                        )
+                        convert_to_request_log(
+                            message=f"Deterministic routing on node '{routing_info.get('previous_node', '?')}'\n{expression_trace}",
+                            meta_info=meta_info,
+                            model="deterministic",
+                            component=LogComponent.GRAPH_ROUTING,
+                            direction=LogDirection.REQUEST,
+                            run_id=self.run_id,
+                        )
+
+                    # Build routing response data
+                    if routing_info.get("transitioned"):
+                        routing_data = (
+                            f"Node: {routing_info.get('previous_node', '?')} → {routing_info['current_node']}"
+                        )
+                    else:
+                        routing_data = f"Node: {routing_info['current_node']} (no transition)"
+                    if routing_info.get("extracted_params"):
+                        routing_data += f" | Params: {json.dumps(routing_info['extracted_params'])}"
+                    if routing_info.get("confidence") is not None:
+                        routing_data += f" | Confidence: {routing_info['confidence']}"
+                    if routing_info.get("reasoning"):
+                        routing_data += f" | Reasoning: {routing_info['reasoning']}"
+                    if routing_info.get("node_history"):
+                        routing_data += f" | Flow: {' → '.join(routing_info['node_history'])}"
+
+                    meta_info["llm_metadata"] = meta_info.get("llm_metadata") or {}
+                    meta_info["llm_metadata"]["graph_routing_info"] = routing_info
+
+                    routing_usage = routing_info.get("routing_usage") or {}
+                    if routing_info.get("routing_latency_ms") is not None:
+                        self.routing_latencies["turn_latencies"].append(
+                            {
+                                "latency_ms": routing_info["routing_latency_ms"],
+                                "routing_end_ms": round(time.time() * 1000 - self.conversation_start_init_ts, 2),
+                                "routing_model": routing_info.get("routing_model"),
+                                "routing_provider": routing_info.get("routing_provider"),
+                                "routing_reasoning_effort": routing_info.get("routing_reasoning_effort"),
+                                "previous_node": routing_info.get("previous_node"),
+                                "current_node": routing_info.get("current_node"),
+                                "transitioned": routing_info.get("transitioned", False),
+                                "sequence_id": meta_info.get("sequence_id"),
+                                "reasoning": routing_info.get("reasoning"),
+                                "confidence": routing_info.get("confidence"),
+                                "input_tokens": routing_usage.get("input_tokens"),
+                                "output_tokens": routing_usage.get("output_tokens"),
+                                "reasoning_tokens": routing_usage.get("reasoning_tokens"),
+                                "cached_tokens": routing_usage.get("cached_tokens"),
+                                "service_tier": routing_usage.get("service_tier"),
+                            }
+                        )
+
+                    if routing_info.get("node_history"):
+                        self.routing_latencies["node_flow"] = list(routing_info["node_history"])
+
+                    # Log routing response
+                    convert_to_request_log(
+                        message=routing_data,
+                        meta_info=meta_info,
+                        model=routing_info.get("routing_model", ""),
+                        component=LogComponent.GRAPH_ROUTING,
+                        direction=LogDirection.RESPONSE,
+                        run_id=self.run_id,
+                        input_tokens=routing_usage.get("input_tokens"),
+                        output_tokens=routing_usage.get("output_tokens"),
+                        reasoning_tokens=routing_usage.get("reasoning_tokens"),
+                        cached_tokens=routing_usage.get("cached_tokens"),
+                    )
+
+                    is_silence_trigger = routing_info.get("is_silence_trigger", False)
+
+                    current_node = self.tools["llm_agent"].get_node_by_id(routing_info["current_node"])
+                    if current_node:
+                        self.repeat_after_silence_seconds = current_node.get("repeat_after_silence_seconds")
+
+                    continue
+
+                if isinstance(llm_message, dict) and "static_message" in llm_message:
+                    static_text = llm_message["static_message"]
+                    static_hash = llm_message["static_audio_hash"]
+                    turn_id = meta_info.get("turn_id")
+                    response_uid = meta_info.get("response_uid")
+
+                    if not is_silence_trigger:
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": static_text,
+                                "turn_id": turn_id,
+                                "response_uid": response_uid,
+                            }
+                        )
+                        self._stage_assistant_history(meta_info, static_text)
+                        self.conversation_history.sync_interim(messages)
+
+                    convert_to_request_log(
+                        message=static_text,
+                        meta_info=meta_info,
+                        component=LogComponent.LLM,
+                        direction=LogDirection.RESPONSE,
+                        model="static_node",
+                        is_cached=True,
+                        run_id=self.run_id,
+                    )
+
+                    meta_info["end_of_llm_stream"] = True
+                    meta_info["text"] = static_text
+                    meta_info["cached"] = True
+                    meta_info["message_category"] = "static_node"
+                    ws_packet = create_ws_data_packet(static_hash, meta_info=meta_info, is_md5_hash=True)
+                    await self._synthesize(ws_packet)
+                    return
+
+                data = llm_message.data
+                end_of_llm_stream = llm_message.end_of_stream
+                latency = llm_message.latency
+                trigger_function_call = llm_message.is_function_call
+                function_tool = llm_message.function_name
+                function_tool_message = llm_message.function_message
+
+                # Capture actual token counts from any chunk that carries them
+                if llm_message.input_tokens is not None:
+                    actual_input_tokens = llm_message.input_tokens
+                if llm_message.output_tokens is not None:
+                    actual_output_tokens = llm_message.output_tokens
+                if llm_message.reasoning_tokens is not None:
+                    actual_reasoning_tokens = llm_message.reasoning_tokens
+                if llm_message.cached_tokens is not None:
+                    actual_cached_tokens = llm_message.cached_tokens
+                if llm_message.reasoning_content is not None:
+                    actual_reasoning_content = llm_message.reasoning_content
+
+                if trigger_function_call:
+                    self.function_call_in_flight = True  # so a parallel LID switch won't truncate it
+                    logger.info(f"Triggering function call for {data}")
+                    # Stamp total_stream_duration_ms before early return — function call chunk carries the final latency
+                    if latency:
+                        fc_latency_dict = latency.model_dump()
+                        textual_response = data.textual_response if hasattr(data, "textual_response") else None
+                        self._stamp_llm_latency_dict(
+                            fc_latency_dict,
+                            meta_info,
+                            actual_input_tokens,
+                            actual_output_tokens,
+                            actual_reasoning_tokens,
+                            actual_cached_tokens,
+                            response_text=textual_response,
+                        )
+                        prev = self.llm_latencies.turn_latencies[-1] if self.llm_latencies.turn_latencies else None
+                        if prev and prev.get("sequence_id") == fc_latency_dict.get("sequence_id"):
+                            # Carry the stub's llm_start_ms forward if the completion stamp is null.
+                            if fc_latency_dict.get("llm_start_ms") is None and prev.get("llm_start_ms") is not None:
+                                fc_latency_dict["llm_start_ms"] = prev["llm_start_ms"]
+                            self.llm_latencies.turn_latencies[-1] = fc_latency_dict
+                        else:
+                            self.llm_latencies.turn_latencies.append(fc_latency_dict)
+                    else:
+                        textual_response = None
+                    if textual_response:  # intentionally omitting tool_calls, which will be filled later if the tool_call flow completed (requirement from OpenAI)
+                        self.__store_into_history(
+                            meta_info,
+                            messages,
+                            textual_response,
+                            should_trigger_function_call=should_trigger_function_call,
+                            input_tokens=actual_input_tokens,
+                            output_tokens=actual_output_tokens,
+                            reasoning_tokens=actual_reasoning_tokens,
+                            cached_tokens=actual_cached_tokens,
+                            reasoning_content=actual_reasoning_content,
+                        )
+                    try:
+                        await self.__execute_function_call(next_step=next_step, **data.model_dump())
+                    finally:
+                        self.function_call_in_flight = False
+                    return
+
+                if latency:
+                    latency_dict = latency.model_dump()
+                    self._stamp_llm_latency_dict(
+                        latency_dict,
+                        meta_info,
+                        actual_input_tokens,
+                        actual_output_tokens,
+                        actual_reasoning_tokens,
+                        actual_cached_tokens,
+                    )
+                    previous_latency_item = (
+                        self.llm_latencies.turn_latencies[-1] if self.llm_latencies.turn_latencies else None
+                    )
+                    if previous_latency_item and previous_latency_item.get("sequence_id") == latency_dict.get(
+                        "sequence_id"
+                    ):
+                        # The eager stub carries the correct llm_start_ms; carry it forward if the
+                        if (
+                            latency_dict.get("llm_start_ms") is None
+                            and previous_latency_item.get("llm_start_ms") is not None
+                        ):
+                            latency_dict["llm_start_ms"] = previous_latency_item["llm_start_ms"]
+                        self.llm_latencies.turn_latencies[-1] = latency_dict
+                    else:
+                        self.llm_latencies.turn_latencies.append(latency_dict)
+
+                llm_response += " " + data
+
+                logger.info(f"Got a response from LLM {llm_response}")
+                if end_of_llm_stream:
+                    meta_info["end_of_llm_stream"] = True
+
+                if self.stream:
+                    text_chunk = self.__process_stop_words(data, meta_info)
+
+                    # A hack as during the 'await' part control passes to llm streaming function parameters
+                    # So we have to make sure we've commited the filler message
+                    # Only the function-call chunk carries function_tool; gate here so the compute + mismatch log run once for the filler, not per text chunk.
+                    if function_tool:
+                        # Match the language snapshotted at pre-call time (what the accumulator built the filler with), not live self.language which can flip mid-turn.
+                        pre_call_language = meta_info.get("detected_language") or self.language
+                        if pre_call_language != self.language:
+                            logger.info(
+                                f"Filler language mismatch: pre_call_language={pre_call_language} vs current self.language={self.language}; matching against pre_call_language"
+                            )
+                        filler_message = compute_function_pre_call_message(
+                            pre_call_language, function_tool, function_tool_message
+                        )
+                        # filler_message = PRE_FUNCTION_CALL_MESSAGE.get(self.language, PRE_FUNCTION_CALL_MESSAGE[DEFAULT_LANGUAGE_CODE])
+                        if text_chunk == filler_message:
+                            logger.info("Got a pre function call message")
+                            turn_id = meta_info.get("turn_id")
+                            response_uid = meta_info.get("response_uid")
+                            messages.append(
+                                {
+                                    "role": "assistant",
+                                    "content": filler_message,
+                                    "turn_id": turn_id,
+                                    "response_uid": response_uid,
+                                }
+                            )
+                            self._stage_assistant_history(meta_info, filler_message)
+                            self.conversation_history.sync_interim(messages)
+
+                    await self._handle_llm_output(next_step, text_chunk, should_bypass_synth, meta_info)
+        except VoxComponentError:
+            raise
+        except Exception as e:
+            raise LLMError(str(e), provider=self.llm_config.get("provider"), model=self.llm_config.get("model")) from e
+
+        filler_message = compute_function_pre_call_message(
+            meta_info.get("detected_language") or self.language, function_tool, function_tool_message
+        )
+        if self.stream and llm_response != filler_message:
+            self.__store_into_history(
+                meta_info,
+                messages,
+                llm_response,
+                should_trigger_function_call=should_trigger_function_call,
+                input_tokens=actual_input_tokens,
+                output_tokens=actual_output_tokens,
+                reasoning_tokens=actual_reasoning_tokens,
+                cached_tokens=actual_cached_tokens,
+                reasoning_content=actual_reasoning_content,
+            )
+        elif not self.stream:
+            llm_response = llm_response.strip()
+            if self.turn_based_conversation:
+                self.conversation_history.append_assistant(llm_response)
+            await self._handle_llm_output(
+                next_step, llm_response, should_bypass_synth, meta_info, is_function_call=should_trigger_function_call
+            )
+            convert_to_request_log(
+                message=llm_response,
+                meta_info=meta_info,
+                component=LogComponent.LLM,
+                direction=LogDirection.RESPONSE,
+                model=self.llm_config["model"],
+                run_id=self.run_id,
+                input_tokens=actual_input_tokens,
+                output_tokens=actual_output_tokens,
+                reasoning_tokens=actual_reasoning_tokens,
+                cached_tokens=actual_cached_tokens,
+                reasoning_content=actual_reasoning_content,
+            )
+
+        # Stamp full response text on the last LLM turn entry (new field, no existing fields changed)
+        if llm_response.strip() and self.llm_latencies.turn_latencies:
+            self.llm_latencies.turn_latencies[-1]["response_text"] = llm_response.strip()
+
+        # Collect RAG latency if present (from KnowledgeBaseAgent)
+        if meta_info.get("rag_latency"):
+            rag_latency = meta_info["rag_latency"]
+            existing_seq_ids = [t.get("sequence_id") for t in self.rag_latencies["turn_latencies"]]
+            if rag_latency.get("sequence_id") not in existing_seq_ids:
+                self.rag_latencies["turn_latencies"].append(rag_latency)
+
+    def _append_eager_llm_stub(self, meta_info):
+        """Record an LLM turn's start immediately (sequence_id/turn_id/asr_turn_id/llm_start_ms)
+        so a hung/cancelled/interrupted turn still appears in progression. __do_llm_generation
+        upserts by sequence_id on completion, replacing this stub. Used by BOTH the normal turn
+        path and the language-switch follow-up, so switched turns are stamped identically."""
+        _t_s = self.tools.get("transcriber")
+        if hasattr(_t_s, "transcribers") and hasattr(_t_s, "active_label"):
+            _t_s = _t_s.transcribers.get(_t_s.active_label, _t_s)
+        start = meta_info.get("llm_start_time")
+        self.llm_latencies.turn_latencies.append(
+            {
+                "sequence_id": meta_info.get("sequence_id"),
+                "turn_id": meta_info.get("turn_id"),
+                "asr_turn_id": getattr(_t_s, "turn_counter", None),
+                "model": self.llm_config.get("model") if self.llm_config else None,
+                "llm_start_ms": round(start * 1000 - self.conversation_start_init_ts, 2) if start else None,
+            }
+        )
+
+    async def _process_conversation_task(self, message, sequence, meta_info):
+        should_bypass_synth = "bypass_synth" in meta_info and meta_info["bypass_synth"] is True
+        next_step = self._get_next_step(sequence, "llm")
+        meta_info["llm_start_time"] = time.time()
+        meta_info["_non_fatal_errors"] = []
+        self._append_eager_llm_stub(meta_info)
+
+        if self.turn_based_conversation:
+            self.history.append({"role": "user", "content": message["data"]})
+        messages = self.conversation_history.get_copy()
+
+        # Request logs converted inside do_llm_generation for knowledgebase agent
+        if not self.__is_knowledgebase_agent() and not self.__is_graph_agent():
+            convert_to_request_log(
+                message=format_messages(messages, use_system_prompt=True, include_tools=True),
+                meta_info=meta_info,
+                component=LogComponent.LLM,
+                direction=LogDirection.REQUEST,
+                model=self.llm_config["model"],
+                run_id=self.run_id,
+            )
+
+        try:
+            await self.__do_llm_generation(messages, meta_info, next_step, should_bypass_synth)
+            if self.task_id == 0:  # conversation LLM only; report the turn's first-token latency (shadow breaker)
+                _ttft = (
+                    self.llm_latencies.turn_latencies[-1].get("first_token_latency_ms")
+                    if self.llm_latencies.turn_latencies
+                    else None
+                )
+                await self._report_provider_health(
+                    "llm", self.llm_config.get("provider"), self.llm_config.get("model"), True, _ttft
+                )
+        except asyncio.CancelledError:
+            # Stamp cancellation on this sequence's latency entry (eager stub or completed entry)
+            # so hung/cancelled LLM calls are distinguishable from still-running ones in progression.
+            cancelled_seq = meta_info.get("sequence_id")
+            for latency_entry in reversed(self.llm_latencies.turn_latencies):
+                if latency_entry.get("sequence_id") == cancelled_seq:
+                    latency_entry["cancelled_at_ms"] = round(time.time() * 1000 - self.conversation_start_init_ts, 2)
+                    break
+            raise
+
+        for _err in meta_info.get("_non_fatal_errors", []):
+            self.non_fatal_llm_error_events.append(_err)
+
+        # TODO : Write a better check for completion prompt
+
+        # Hangup detection - now supported for all agent types including graph_agent.
+        # Skipped when end_call is the primary hangup; those agents hang up via the tool.
+        if self.use_llm_to_determine_hangup and not self.turn_based_conversation and not self.end_call_primary:
+            completion_res, metadata = await self.tools["llm_agent"].check_for_completion(
+                messages, self.check_for_completion_prompt, meta_info=meta_info
+            )
+
+            should_hangup = (
+                str(completion_res.get("hangup", "")).lower() == "yes" if isinstance(completion_res, dict) else False
+            )
+
+            # Track hangup check latency (latency returned by agent)
+            self.llm_latencies.other_latencies.append(
+                {
+                    "type": "hangup_check",
+                    "ts_ms": round(time.time() * 1000 - self.conversation_start_init_ts, 2),
+                    "latency_ms": metadata.get("latency_ms", None),
+                    "model": self.check_for_completion_llm,
+                    "provider": "openai",  # TODO: Make dynamic based on provider used
+                    "service_tier": metadata.get("service_tier", None),
+                    "llm_host": metadata.get("llm_host", None),
+                    "sequence_id": meta_info.get("sequence_id"),
+                    "turn_id": meta_info.get("turn_id"),
+                }
+            )
+
+            prompt = [
+                {"role": "system", "content": self.check_for_completion_prompt},
+                {"role": "user", "content": format_messages(self.history)},
+            ]
+            logger.info(f"##### Answer from the LLM {completion_res}")
+            convert_to_request_log(
+                message=format_messages(prompt, use_system_prompt=True),
+                meta_info=meta_info,
+                component=LogComponent.LLM_HANGUP,
+                direction=LogDirection.REQUEST,
+                model=self.check_for_completion_llm,
+                run_id=self.run_id,
+            )
+            convert_to_request_log(
+                message=completion_res,
+                meta_info=meta_info,
+                component=LogComponent.LLM_HANGUP,
+                direction=LogDirection.RESPONSE,
+                model=self.check_for_completion_llm,
+                run_id=self.run_id,
+                input_tokens=metadata.get("input_tokens"),
+                output_tokens=metadata.get("output_tokens"),
+                reasoning_tokens=metadata.get("reasoning_tokens"),
+                cached_tokens=metadata.get("cached_tokens"),
+            )
+
+            if should_hangup:
+                if self.hangup_triggered or self.conversation_ended:
+                    logger.info(f"Hangup already triggered or conversation ended, skipping duplicate hangup request")
+                    return
+                self.hangup_detail = HangupReason.LLM_PROMPTED_HANGUP
+                await self.process_call_hangup()
+                return
+
+        self.llm_processed_request_ids.add(self.current_request_id)
+        llm_response = ""
+
+    def _enter_hangup_state(self):
+        self.hangup_triggered = True
+        if self.hangup_decision_at is None:
+            self.hangup_decision_at = time.time()
+        # Hangup gates transcriber input, so release the audio gate now or the goodbye stalls on WAIT.
+        self.interruption_manager.on_user_speech_ended(update_utterance_time=False)
+
+    def _should_ignore_transcriber_input(self) -> bool:
+        return self.hangup_triggered or self._end_call_in_progress or self.has_transfer
+
+    async def process_call_hangup(self):
+        if self.hangup_decision_at is None:
+            self.hangup_decision_at = time.time()
+        if self._hangup_processing or self.conversation_ended:
+            logger.info(f"process_call_hangup: Hangup already in progress or conversation ended, skipping")
+            return
+
+        self._hangup_processing = True
+        self.hangup_triggered = True
+        message = self.call_hangup_message if not self.voicemail_handler.detected else ""
+        if not message or message.strip() == "":
+            self.hangup_message_queued = False  # No hangup message to wait for
+            self.hangup_triggered_at = time.time()
+            await self.__process_end_of_conversation()
+        else:
+            self.hangup_message_queued = True  # Hangup message will be synthesized
+            await self.wait_for_current_message()
+            await self.__cleanup_downstream_tasks()
+            meta_info = {
+                "io": self.tools["output"].get_provider(),
+                "request_id": str(uuid.uuid4()),
+                "cached": False,
+                "sequence_id": -1,
+                "format": "pcm",
+                "message_category": "agent_hangup",
+                "end_of_llm_stream": True,
+            }
+            await self._synthesize(create_ws_data_packet(message, meta_info=meta_info))
+            # Stamp after goodbye is queued — actual disconnect happens after it plays
+            self.hangup_triggered_at = time.time()
+        return
+
+    async def _listen_llm_input_queue(self):
+        logger.info(
+            f"Starting listening to LLM queue as either Connected to dashboard = {self.turn_based_conversation} or  it's a textual chat agent {self.textual_chat_agent}"
+        )
+        while True:
+            try:
+                ws_data_packet = await self.queues["llm"].get()
+                logger.info(f"ws_data_packet {ws_data_packet}")
+                meta_info = self.__get_updated_meta_info(ws_data_packet["meta_info"])
+                bos_packet = create_ws_data_packet("<beginning_of_stream>", meta_info)
+                await self.tools["output"].handle(bos_packet)
+                # self.interim_history = self.history.copy()
+                # self.history.append({'role': 'user', 'content': ws_data_packet['data']})
+                await self._run_llm_task(create_ws_data_packet(ws_data_packet["data"], meta_info))
+                eos_packet = create_ws_data_packet("<end_of_stream>", meta_info)
+                await self.tools["output"].handle(eos_packet)
+
+            except Exception as e:
+                traceback.print_exc()
+                logger.error(f"Something went wrong with LLM queue {e}")
+                break
+
+    async def _run_llm_task(self, message):
+        sequence, meta_info = self._extract_sequence_and_meta(message)
+
+        try:
+            if self._is_extraction_task() or self._is_summarization_task():
+                await self._process_followup_task(message)
+            elif self._is_conversation_task():
+                await self._process_conversation_task(message, sequence, meta_info)
+            else:
+                logger.error("unsupported task type: {}".format(self.task_config["task_type"]))
+            self.llm_task = None
+        except VoxComponentError as e:
+            self.response_in_pipeline = False
+            await self._end_call_on_component_error(e, HangupReason.LLM_ERROR)
+            raise
+        except Exception as e:
+            self.response_in_pipeline = False
+            await self._end_call_on_component_error(
+                LLMError(
+                    str(e), provider=self.llm_config.get("provider", "unknown"), model=self.llm_config.get("model")
+                ),
+                HangupReason.LLM_ERROR,
+            )
+
+    #################################################################
+    # Transcriber task
+    #################################################################
+    async def process_transcriber_request(self, meta_info):
+        request_id = meta_info.get("request_id")
+        if request_id and (not self.current_request_id or self.current_request_id != request_id):
+            self.previous_request_id, self.current_request_id = self.current_request_id, request_id
+
+        sequence = meta_info.get("sequence", 0)
+
+        # check if previous request id is not in transmitted request id
+        if self.previous_request_id is None:
+            is_first_message = True
+        elif self.previous_request_id not in self.llm_processed_request_ids:
+            logger.info(f"Adding previous request id to LLM rejected request if")
+            self.llm_rejected_request_ids.add(self.previous_request_id)
+        else:
+            skip_append_to_data = False
+        return sequence
+
+    def _trigger_voicemail_check(self, transcriber_message, meta_info, is_final=True):
+        self.voicemail_handler.trigger_check(transcriber_message, meta_info, is_final)
+
+    def _stage_assistant_history(self, meta_info, content):
+        sequence_id = meta_info.get("sequence_id")
+        response_uid = meta_info.get("response_uid")
+        turn_id = meta_info.get("turn_id")
+        if sequence_id is None or not content or not str(content).strip():
+            return
+        self._pending_assistant_history[sequence_id] = {
+            "content": content,
+            "turn_id": turn_id,
+            "response_uid": response_uid,
+        }
+        logger.info(
+            "VOX_TRACE_TM stage_assistant_history seq=%s turn=%s response_uid=%s text_len=%s",
+            sequence_id,
+            turn_id,
+            response_uid,
+            len(content),
+        )
+        # Rescue commit: SEND already passed for this seq (e.g. text+tool_call turn
+        # where args stream after the spoken text), so SEND-time commit was a no-op.
+        if sequence_id in self._sent_audio_sequences and sequence_id not in self._blocked_sequences:
+            self._commit_staged_assistant_history(sequence_id)
+
+    def _commit_staged_assistant_history(self, sequence_id):
+        if sequence_id in self._committed_assistant_sequences:
+            return
+        staged = self._pending_assistant_history.pop(sequence_id, None)
+        if staged is None:
+            return
+
+        self._committed_assistant_sequences.add(sequence_id)
+        self.conversation_history.append_assistant(
+            staged["content"], turn_id=staged["turn_id"], response_uid=staged["response_uid"]
+        )
+        if staged["turn_id"] is not None:
+            self._turn_msg_map[staged["turn_id"]] = self.conversation_history.messages[-1]
+        logger.info(
+            "VOX_TRACE_TM commit_assistant_history seq=%s turn=%s response_uid=%s text_len=%s",
+            sequence_id,
+            staged["turn_id"],
+            staged["response_uid"],
+            len(staged["content"]),
+        )
+
+    def _drop_staged_assistant_history(self, sequence_id, reason):
+        staged = self._pending_assistant_history.pop(sequence_id, None)
+        if staged is None:
+            return
+        logger.info(
+            "VOX_TRACE_TM drop_assistant_history seq=%s turn=%s response_uid=%s reason=%s",
+            sequence_id,
+            staged["turn_id"],
+            staged["response_uid"],
+            reason,
+        )
+
+    def _drop_all_staged_assistant_history(self, reason, keep_sequence_ids=None):
+        keep_sequence_ids = set(keep_sequence_ids or [])
+        drop_sequence_ids = [seq for seq in self._pending_assistant_history.keys() if seq not in keep_sequence_ids]
+        for sequence_id in drop_sequence_ids:
+            self._drop_staged_assistant_history(sequence_id, reason)
+
+    def _retire_dropped_response(self, meta_info, reason):
+        sequence_id = meta_info.get("sequence_id")
+        response_uid = meta_info.get("response_uid")
+        turn_id = meta_info.get("turn_id")
+        self._drop_staged_assistant_history(sequence_id, reason)
+        self.interruption_manager.retire_sequence_id(sequence_id)
+        logger.info(
+            "VOX_TRACE_TM drop_response seq=%s turn=%s response_uid=%s reason=%s",
+            sequence_id,
+            turn_id,
+            response_uid,
+            reason,
+        )
+
+    async def _handle_transcriber_output(self, next_task, transcriber_message, meta_info):
+        logger.info(
+            "VOX_TRACE_TM handle_transcript next=%s seq=%s turn=%s response_uid=%s group_uid=%s request_id=%s text_len=%s text=%r",
+            next_task,
+            meta_info.get("sequence_id"),
+            meta_info.get("turn_id"),
+            meta_info.get("response_uid"),
+            meta_info.get("response_group_uid"),
+            meta_info.get("request_id"),
+            len((transcriber_message or "").strip()),
+            (transcriber_message or "")[:120],
+        )
+        if not self.tools["input"].welcome_message_played():
+            logger.info(f"Welcome message is playing while spoken: {transcriber_message}")
+            self._retire_dropped_response(meta_info, "welcome_still_playing")
+            return
+
+        if self._speech_started_before_welcome:
+            logger.info(
+                f"Discarding transcript from speech that started before welcome finished: {transcriber_message}"
+            )
+            self._speech_started_before_welcome = False
+            self._retire_dropped_response(meta_info, "speech_started_before_welcome_finished")
+            return
+
+        if self.conversation_history.is_duplicate_user(transcriber_message):
+            logger.info(f"Skipping duplicate transcript (same content): {transcriber_message}")
+            self._retire_dropped_response(meta_info, "duplicate_user_transcript")
+            return
+
+        # Mirror the accepted transcript to the client, if the transport can show
+        # one. Placed after the discard guards so the visitor never sees a line
+        # the agent then ignores.
+        transport = self.kwargs.get("transport")
+        if transport is not None and (transcriber_message or "").strip():
+            await transport.publish_data(
+                {"type": "transcript", "role": "user", "text": transcriber_message.strip(), "final": True}
+            )
+
+        self._trigger_voicemail_check(transcriber_message, meta_info, is_final=True)
+
+        if self.voicemail_handler.detected:
+            logger.info("Voicemail already detected - skipping normal transcriber output processing")
+            self._retire_dropped_response(meta_info, "voicemail_detected")
+            return
+
+        await self.language_detector.collect_transcript(transcriber_message)
+
+        current_sequence_id = meta_info.get("sequence_id")
+        activity = self._inflight_response_activity(exclude_sequence_id=current_sequence_id)
+        if next_task == "llm" and any(activity.values()):
+            logger.info(
+                "VOX_TRACE_TM cleanup_before_user_append seq=%s turn=%s response_uid=%s response_in_pipeline=%s audio_playing=%s pending_marks=%s pending_sequences=%s pending_generation=%s",
+                meta_info.get("sequence_id"),
+                meta_info.get("turn_id"),
+                meta_info.get("response_uid"),
+                activity["response_in_pipeline"],
+                activity["audio_playing"],
+                activity["pending_marks"],
+                activity["pending_sequences"],
+                activity["pending_generation"],
+            )
+            original_message = transcriber_message
+            transcriber_message = self.conversation_history.pop_and_merge_user(transcriber_message)
+            if transcriber_message != original_message:
+                logger.info(f"Merged transcript with unheard response: {transcriber_message}")
+            await self.__cleanup_downstream_tasks()
+            # cleanup invalidates all pending sequence ids. The current turn's
+            # sequence_id was already allocated by __get_updated_meta_info, so
+            # we must re-register it or the fresh LLM response will later be
+            # dropped in _synthesize as an invalid sequence.
+            self.interruption_manager.revalidate_sequence_id(current_sequence_id)
+            logger.info(
+                "VOX_TRACE_TM revalidated_current_seq_after_cleanup seq=%s turn=%s response_uid=%s",
+                meta_info.get("sequence_id"),
+                meta_info.get("turn_id"),
+                meta_info.get("response_uid"),
+            )
+
+        # Mid-speech silent switch: this is the first turn after the pools flipped
+        # while the caller was still talking. The active ASR only heard the
+        # post-switch tail, so swap its text for the FULL unbiased transcript:
+        # the pre-switch detector prefix captured at switch time + everything the
+        # detector heard since (drained now).
+        if self._pending_switch_turn is not None:
+            pending_switch = self._pending_switch_turn
+            self._pending_switch_turn = None
+            if self._post_switch_fallback_task is not None and not self._post_switch_fallback_task.done():
+                self._post_switch_fallback_task.cancel()
+            drained_tail = ""
+            tail_segments = []
+            pending_pool = self.tools.get("transcriber")
+            if isinstance(pending_pool, TranscriberPool):
+                tail_segments = pending_pool.lid_buffer_segments()
+                drained_tail, _ = pending_pool.take_lid_transcript()
+            full_unbiased = " ".join(filter(None, [pending_switch["prefix"], drained_tail])).strip()
+            # Last utterance only — the prefix can span stale earlier utterances.
+            composed = (
+                trailing_utterance_text(list(pending_switch.get("segments") or []) + tail_segments) or full_unbiased
+            )
+            if composed:
+                logger.info(
+                    f"LanguageSwitcher: composed unbiased turn after silent switch "
+                    f"(asr_tail={(transcriber_message or '')[:40]!r} → {composed[:80]!r})"
+                )
+                transcriber_message = composed
+
+        self.conversation_history.append_user(transcriber_message)
+        logger.info(
+            "VOX_TRACE_TM append_user seq=%s turn=%s response_uid=%s history_len=%s text=%r",
+            meta_info.get("sequence_id"),
+            meta_info.get("turn_id"),
+            meta_info.get("response_uid"),
+            len(self.conversation_history.messages),
+            (transcriber_message or "")[:120],
+        )
+
+        convert_to_request_log(
+            message=transcriber_message, meta_info=meta_info, model=self.transcriber_provider, run_id=self.run_id
+        )
+        if next_task == "llm":
+            logger.info(f"Running llm Tasks")
+            meta_info["origin"] = "transcriber"
+            transcriber_package = create_ws_data_packet(transcriber_message, meta_info)
+
+            # Cancel any existing LLM task to prevent orphaned concurrent responses
+            if self.llm_task is not None and not self.llm_task.done():
+                logger.info("Cancelling existing LLM task for new speech_final")
+                self.llm_task.cancel()
+                self.llm_task = None
+                self.interruption_manager.invalidate_pending_responses()
+                self._drop_all_staged_assistant_history("llm_task_cancelled_for_new_speech_final")
+                # Re-register the current sequence_id (already allocated by
+                # __get_updated_meta_info) so the new response's audio is not blocked
+                self.interruption_manager.revalidate_sequence_id(meta_info["sequence_id"])
+
+            # Always revalidate the new sequence_id — if the old task already
+            # completed and invalidate_pending_responses was called from the
+            # interruption path, the new seq_id would otherwise never be added
+            # back to sequence_ids, causing all audio to be BLOCKed permanently.
+            self.interruption_manager.revalidate_sequence_id(meta_info["sequence_id"])
+            self.response_in_pipeline = True
+            # Once-per-turn language-switch decision (no-op unless gated on); background
+            # task so it never delays the main LLM. When the detector already tagged this
+            decision_task = self._spawn_language_switch_decision(transcriber_message, meta_info)
+            if decision_task is not None and self.__detector_language_mismatch():
+                self.llm_task = asyncio.create_task(
+                    self.__run_llm_after_switch_decision(transcriber_package, decision_task, self.language)
+                )
+            else:
+                self.llm_task = asyncio.create_task(self._run_llm_task(transcriber_package))
+
+        elif next_task == "synthesizer":
+            self.synthesizer_tasks.append(
+                asyncio.create_task(self._synthesize(create_ws_data_packet(transcriber_message, meta_info)))
+            )
+        else:
+            logger.info(f"Need to separate out output task")
+
+    async def _report_provider_health(self, service, provider, model, ok, latency_ms=None, phase=None, blocking=False):
+        """Per-provider health signal for the circuit breaker (shadow). Never affects the call.
+
+        phase distinguishes connection setup ("connect") from per-turn processing ("process", the
+        default). Fire-and-forget by default. On the error path pass blocking=True so the write lands
+        before the call tears down (a bare create_task would be cancelled by shutdown); the timeout
+        keeps a slow Redis from ever delaying teardown.
+        """
+        if not self.on_provider_health or not provider:
+            return
+        try:
+            coro = self.on_provider_health(service, provider, model, ok, latency_ms, phase)
+            if blocking:
+                await asyncio.wait_for(coro, timeout=2)
+                return
+            _cb = asyncio.create_task(coro)
+            self._cb_tasks.add(_cb)
+            _cb.add_done_callback(self._cb_tasks.discard)
+        except Exception:
+            pass
+
+    def _active_tool(self, kind):
+        """Live pool member for a transcriber/synthesizer (or the tool itself when not pooled)."""
+        tool = self.tools.get(kind)
+        pool = getattr(tool, f"{kind}s", None)
+        if pool is not None and hasattr(tool, "active_label"):
+            return pool.get(tool.active_label, tool)
+        return tool
+
+    async def _report_component_health(self, service, provider, process_latency_ms, connect_flag):
+        """Per-turn ASR/TTS success for the shadow breaker, plus the connection latency once."""
+        if not self.on_provider_health or not provider:
+            return
+        # model=None matches the fail side (component errors carry no model) so both share one member.
+        if not getattr(self, connect_flag):
+            conn_ms = getattr(self._active_tool(service), "connection_time", None)
+            if conn_ms is not None:
+                setattr(self, connect_flag, True)
+                await self._report_provider_health(service, provider, None, True, conn_ms, phase="connect")
+        await self._report_provider_health(service, provider, None, True, process_latency_ms, phase="process")
+
+    async def _report_stream_connect(self):
+        """Media-stream (stream_sid) connect latency for the shadow breaker: telephony only, once/call."""
+        if not self.on_provider_health or self._cb_stream_reported or not self.stream_sid_ts:
+            return
+        provider = self.tools["input"].io_provider
+        if provider in (None, "default"):
+            return
+        self._cb_stream_reported = True
+        # welcome_message_delay is slept through before the poll; it is agent config, not carrier latency.
+        latency_ms = round(self.stream_sid_ts - self.conversation_start_init_ts - (self.welcome_message_delay or 0))
+        await self._report_provider_health(
+            "telephony_stream", provider, None, True, max(0, latency_ms), phase="connect"
+        )
+
+    async def _end_call_on_component_error(self, error, hangup_detail):
+        """End the call gracefully when a critical pipeline component fails.
+
+        Handles: CSV error logging, _component_error tracking, and triggering
+        __process_end_of_conversation for immediate graceful shutdown.
+        """
+        if self._component_error is None:
+            self._component_error = {
+                "cls": type(error),
+                "message": str(error),
+                "provider": getattr(error, "provider", None),
+                "model": getattr(error, "model", None),
+            }
+            await self._report_provider_health(
+                getattr(error, "component", "unknown"),
+                getattr(error, "provider", None),
+                getattr(error, "model", None),
+                False,
+                blocking=True,
+            )
+
+        # Log to CSV if not already done
+        if self.run_id and not self._error_logged:
+            if isinstance(error, VoxComponentError):
+                error_msg = format_error_message(error.component, error.provider or error.model or "-", str(error))
+                model = error.model or error.provider or "-"
+            else:
+                error_msg = format_error_message("unknown", "-", str(error))
+                model = "-"
+            convert_to_request_log(
+                error_msg,
+                {"request_id": self.task_id, "sequence_id": None},
+                model=model,
+                component=LogComponent.ERROR,
+                direction=LogDirection.ERROR,
+                is_cached=False,
+                run_id=self.run_id,
+            )
+            self._error_logged = True
+
+        # Trigger graceful shutdown
+        if not self.conversation_ended and not self._end_of_conversation_in_progress:
+            self.hangup_detail = hangup_detail
+            await self.__process_end_of_conversation()
+
+    async def _log_transcriber_connection_error(self, connection_error):
+        provider = self.task_config["tools_config"]["transcriber"].get("provider", "unknown")
+        # Always record the drop — "error" when exception drove it, "drop" for clean closes
+        # (e.g. Sarvam normal end-of-stream, Deepgram inactivity timeout on standby).
+        self.transcriber_error_events.append(
+            {
+                "event": "error" if connection_error else "drop",
+                "error": connection_error,
+                "provider": provider,
+                "ts_ms": round(time.time() * 1000 - self.conversation_start_init_ts, 2),
+            }
+        )
+        if connection_error:
+            await self._end_call_on_component_error(
+                TranscriberError(connection_error, provider=provider), HangupReason.TRANSCRIBER_CONNECTION_ERROR
+            )
+
+    async def _maybe_update_tts_language(self, meta_info):
+        """Point a single-connection Sarvam TTS at the language ASR auto-detected; no-op otherwise."""
+        detected = (meta_info or {}).get("detected_language_code")
+        if not detected:
+            return
+        set_language = getattr(self.tools.get("synthesizer"), "set_target_language", None)
+        if set_language is None:
+            return
+        await set_language(detected)
+
+    async def _listen_transcriber(self):
+        temp_transcriber_message = ""
+        try:
+            while True:
+                message = await self.transcriber_output_queue.get()
+                logger.info(f"Message from the transcriber class {message}")
+
+                if self._should_ignore_transcriber_input():
+                    if message["data"] == "transcriber_connection_closed":
+                        logger.info(f"Transcriber connection has been closed")
+                        self.transcriber_duration += (
+                            message.get("meta_info", {}).get("transcriber_duration", 0)
+                            if message["meta_info"] is not None
+                            else 0
+                        )
+                        await self._log_transcriber_connection_error(
+                            (message.get("meta_info") or {}).get("connection_error")
+                        )
+                        break
+                    continue
+
+                if self.stream:
+                    self._set_call_details(message)
+                    meta_info = message["meta_info"]
+                    sequence = await self.process_transcriber_request(meta_info)
+                    next_task = self._get_next_step(sequence, "transcriber")
+                    interim_transcript_len = 0
+
+                    # Handling of transcriber events
+                    if message["data"] == "speech_started":
+                        if not self.tools["input"].welcome_message_played() and self.discard_pre_welcome_utterance:
+                            self._speech_started_before_welcome = True
+                        if self.tools["input"].welcome_message_played():
+                            self._speech_started_before_welcome = False
+                            logger.info(f"User has started speaking")
+                            # self.callee_silent = False
+
+                    # Whenever interim results would be received from Deepgram, this condition would get triggered
+                    elif (
+                        isinstance(message.get("data"), dict)
+                        and message["data"].get("type", "") == "interim_transcript_received"
+                    ):
+                        self.time_since_last_spoken_human_word = time.time()
+                        if temp_transcriber_message == message["data"].get("content"):
+                            logger.info("Received the same transcript as the previous one we have hence continuing")
+                            continue
+
+                        temp_transcriber_message = message["data"].get("content")
+
+                        if not self.tools["input"].welcome_message_played():
+                            if self.discard_pre_welcome_utterance:
+                                self._speech_started_before_welcome = True
+                            continue
+
+                        # Post-welcome interim → clear stale flag set by pre-welcome SpeechStarted (welcome-audio bleed).
+                        self._speech_started_before_welcome = False
+
+                        interim_transcript_len += len(message["data"].get("content").strip().split(" "))
+                        transcript_content = message["data"].get("content", "")
+
+                        atrace.heard(
+                            "interim",
+                            transcript_content,
+                            interim_transcript_len,
+                            self.tools["input"].is_audio_being_played_to_user(),
+                        )
+
+                        # Deepgram sometimes delivers the real speech_final for an utterance
+                        # *after* our utterance timeout already force-finalized the same text
+                        # and started the LLM. Don't treat this late delivery as new user speech
+                        # — the LLM is already processing this exact transcript.
+                        if self.response_in_pipeline and self.conversation_history.is_duplicate_user(
+                            transcript_content
+                        ):
+                            logger.info(
+                                "Skipping interruption: Deepgram late delivery of already-processing transcript: %s",
+                                transcript_content,
+                            )
+                            continue
+
+                        # Defer interim barge-ins while a tool call is in flight (same as speech_final path).
+                        if self.function_call_in_flight:
+                            logger.info(f"Tool call in flight; deferring interim barge-in {transcript_content!r}")
+                            continue
+
+                        if self.interruption_manager.should_trigger_interruption(
+                            word_count=interim_transcript_len,
+                            transcript=transcript_content,
+                            is_audio_playing=self.tools["input"].is_audio_being_played_to_user()
+                            or self.response_in_pipeline,
+                            welcome_played=self.tools["input"].welcome_message_played(),
+                        ):
+                            logger.info(f"Condition for interruption hit")
+                            self.interruption_manager.on_user_speech_started()
+                            _t = self.tools.get("transcriber")
+                            if hasattr(_t, "transcribers") and hasattr(_t, "active_label"):
+                                _t = _t.transcribers.get(_t.active_label, _t)
+                            _asr_turn_id = getattr(_t, "current_turn_id", None)
+                            self.interruption_manager.on_interruption_triggered(asr_turn_id=_asr_turn_id)
+                            # Also record in the interrupted set for was_interrupted annotation
+                            self.interruption_manager.record_interrupted_transcriber_turn(_asr_turn_id)
+                            self.tools["input"].update_is_audio_being_played(False)
+                            await self.__cleanup_downstream_tasks()
+                        # User continuation detection: cancel pending response if user continues within grace period
+                        elif (
+                            not self.tools["input"].is_audio_being_played_to_user()
+                            and self.tools["input"].welcome_message_played()
+                        ):
+                            self.interruption_manager.on_user_speech_started()
+                            has_pending_response = self.interruption_manager.has_pending_responses()
+                            time_since_utterance_end = self.interruption_manager.get_time_since_utterance_end()
+                            within_grace_period = (
+                                time_since_utterance_end != -1
+                                and time_since_utterance_end < self.incremental_delay
+                                and len(self.history) > 2
+                            )
+
+                            if (
+                                has_pending_response
+                                and within_grace_period
+                                and interim_transcript_len > self.number_of_words_for_interruption
+                            ):
+                                logger.info(
+                                    f"User continuation detected ({interim_transcript_len} words within {time_since_utterance_end:.0f}ms), canceling pending response"
+                                )
+                                # on_agent_interrupted_user MUST come before reset_utterance_end_time
+                                # so it can still read the previous turn's utterance_end_time.
+                                _t = self.tools.get("transcriber")
+                                if hasattr(_t, "transcribers") and hasattr(_t, "active_label"):
+                                    _t = _t.transcribers.get(_t.active_label, _t)
+                                self.interruption_manager.on_agent_interrupted_user(
+                                    asr_turn_id=getattr(_t, "current_turn_id", None)
+                                )
+                                self.interruption_manager.reset_utterance_end_time()
+                                await self.__cleanup_downstream_tasks()
+                        elif (
+                            (self.tools["input"].is_audio_being_played_to_user() or self.response_in_pipeline)
+                            and self.tools["input"].welcome_message_played()
+                            and self.number_of_words_for_interruption != 0
+                        ):
+                            # Not enough words for interruption - ignore (don't set callee_speaking)
+                            logger.info(f"Ignoring transcript: {transcript_content.strip()}")
+                            continue
+                        else:
+                            # Normal interim (no audio playing, no continuation) - mark user as speaking
+                            self.interruption_manager.on_user_speech_started()
+
+                        self.interruption_manager.update_required_delay(len(self.history))
+                        self.interruption_manager.on_interim_transcript_received()
+
+                        # Trigger background voicemail check on interim transcripts (non-blocking)
+                        if self.voicemail_handler.enabled and not self.voicemail_handler.detected:
+                            interim_content = message["data"].get("content", "")
+                            self._trigger_voicemail_check(interim_content, meta_info, is_final=False)
+
+                        self.llm_response_generated = False
+
+                    elif (
+                        isinstance(message.get("data"), dict) and message["data"].get("type", "") == "eager_end_of_turn"
+                    ):
+                        eager_transcript = message["data"].get("content", "").strip()
+                        eot_confidence = message["data"].get("confidence")
+                        logger.info(f"EagerEndOfTurn received (confidence={eot_confidence}): {eager_transcript}")
+
+                        transcriber = self.tools.get("transcriber")
+                        active_transcriber = (
+                            transcriber.transcribers.get(transcriber.active_label, transcriber)
+                            if hasattr(transcriber, "transcribers")
+                            else transcriber
+                        )
+                        eager_eot_threshold = getattr(active_transcriber, "eager_eot_threshold", None)
+
+                        if not eager_eot_threshold:
+                            logger.info(
+                                f"Skipping speculative LLM: EagerEOT disabled (eager_eot_threshold not set or zero)"
+                            )
+                        elif eot_confidence is not None and eot_confidence < eager_eot_threshold:
+                            logger.info(
+                                f"Skipping speculative LLM: EagerEOT confidence {eot_confidence} below threshold {eager_eot_threshold}"
+                            )
+                        elif self.language_switcher is not None and self.__detector_language_mismatch():
+                            # An eager reply would stream on the OLD voice before the switch
+                            logger.info(
+                                "Skipping speculative LLM: detector language mismatch — reply holds for the switch decision"
+                            )
+                        elif (
+                            eager_transcript
+                            and self.tools["input"].welcome_message_played()
+                            and not self.tools["input"].is_audio_being_played_to_user()
+                            and not self.response_in_pipeline
+                        ):
+                            logger.info(f"Starting speculative LLM task")
+
+                            if self.output_task is None:
+                                self.output_task = asyncio.create_task(self.__process_output_loop())
+
+                            meta_info = self.__get_updated_meta_info(meta_info)
+                            meta_info["eager_eot"] = True
+                            meta_info["eot_confidence"] = eot_confidence
+
+                            self.eager_history_snapshot = len(self.history)
+                            self.eager_meta_info = meta_info
+                            self.eager_llm_task = asyncio.create_task(
+                                self._run_llm_task(create_ws_data_packet(eager_transcript, meta_info))
+                            )
+                            self.history.append({"role": "user", "content": eager_transcript})
+                        else:
+                            logger.info(f"Skipping speculative LLM (audio playing or welcome not done)")
+
+                    elif isinstance(message.get("data"), dict) and message["data"].get("type", "") == "turn_resumed":
+                        logger.info(f"TurnResumed: Cancelling speculative LLM task")
+
+                        if self.eager_llm_task is not None:
+                            self.eager_llm_task.cancel()
+                            self.eager_llm_task = None
+                            self.eager_meta_info = None
+
+                            snapshot = getattr(self, "eager_history_snapshot", None)
+                            if snapshot is not None and len(self.history) > snapshot:
+                                removed = self.history[snapshot:]
+                                self.history = self.history[:snapshot]
+                                logger.info(f"Reverted {len(removed)} speculative history entries")
+
+                    # Whenever speech_final or UtteranceEnd is received from Deepgram, this condition would get triggered
+                    elif isinstance(message.get("data"), dict) and message["data"].get("type", "") == "transcript":
+                        logger.info(f"Received transcript, sending for further processing")
+                        transcript_content = message["data"].get("content", "")
+                        word_count = len(transcript_content.strip().split(" "))
+                        logger.info(
+                            "VOX_TRACE_TM final_transcript next=%s req=%s word_count=%s audio_playing=%s response_in_pipeline=%s text=%r",
+                            next_task,
+                            meta_info.get("request_id"),
+                            word_count,
+                            self.tools["input"].is_audio_being_played_to_user(),
+                            self.response_in_pipeline,
+                            transcript_content[:120],
+                        )
+
+                        atrace.heard(
+                            "final",
+                            transcript_content,
+                            word_count,
+                            self.tools["input"].is_audio_being_played_to_user(),
+                        )
+
+                        # response_in_pipeline deliberately not counted: with no audio playing yet, a short
+                        # speech_final is a split-utterance tail — _handle_transcriber_output merges it.
+                        if self.interruption_manager.is_false_interruption(
+                            word_count=word_count,
+                            transcript=transcript_content,
+                            is_audio_playing=self.tools["input"].is_audio_being_played_to_user(),
+                            welcome_played=self.tools["input"].welcome_message_played(),
+                        ):
+                            logger.info(
+                                f"Continuing the loop and ignoring the transcript received ({transcript_content}) in speech final as it is false interruption"
+                            )
+                            self.interruption_manager.on_user_speech_ended(update_utterance_time=False)
+                            self._speech_started_before_welcome = False
+                            continue
+
+                        # Starting a new turn here cancels the in-flight tool call before its result is
+                        # recorded, so the LLM re-emits the same tool and the side effect runs twice.
+                        if self.function_call_in_flight:
+                            logger.info(f"Tool call in flight; deferring barge-in transcript {transcript_content!r}")
+                            self.interruption_manager.on_user_speech_ended(update_utterance_time=False)
+                            continue
+
+                        _meta = message.get("meta_info") or {}
+                        self.interruption_manager.on_user_speech_ended(
+                            stop_offset_ms=_meta.get("user_stop_offset_ms", 0),
+                            user_stop_ts_wall=_meta.get("user_stop_ts_wall"),
+                        )
+                        temp_transcriber_message = ""
+
+                        await self._maybe_update_tts_language(meta_info)
+
+                        if self.output_task is None:
+                            logger.info(f"Output task was none and hence starting it")
+                            self.output_task = asyncio.create_task(self.__process_output_loop())
+
+                        self.interruption_manager.reset_delay_for_speech_final(len(self.history))
+
+                        transcriber_message = message["data"].get("content")
+                        was_eager = message["data"].get("was_eager", False)
+
+                        # No process latency: transcribers store first-result latency inconsistently.
+                        await self._report_component_health(
+                            "transcriber",
+                            self.transcriber_provider,
+                            None,
+                            "_cb_transcriber_connect_reported",
+                        )
+
+                        if was_eager and self.eager_llm_task is not None:
+                            logger.info(f"EndOfTurn follows EagerEndOfTurn - using speculative LLM")
+                            # Run side effects that _handle_transcriber_output normally handles,
+                            # but skip creating a new LLM task — reuse the already-running eager one.
+                            self._trigger_voicemail_check(transcriber_message, meta_info, is_final=True)
+                            if not self.voicemail_handler.detected:
+                                await self.language_detector.collect_transcript(transcriber_message)
+                                convert_to_request_log(
+                                    message=transcriber_message,
+                                    meta_info=meta_info,
+                                    model=self.transcriber_provider,
+                                    run_id=self.run_id,
+                                )
+                                # Cancel any existing llm_task the same way _handle_transcriber_output does
+                                if self.llm_task is not None and not self.llm_task.done():
+                                    self.llm_task.cancel()
+                                    self.llm_task = None
+                                    self.interruption_manager.invalidate_pending_responses()
+                                # Revalidate the eager task's sequence_id (not a fresh one) —
+                                # invalidate_pending_responses from the interruption path can remove it,
+                                # and without this call all audio from the eager task would be BLOCKed.
+                                self.interruption_manager.revalidate_sequence_id(self.eager_meta_info["sequence_id"])
+                                self.response_in_pipeline = True
+                                # Mirror the once-per-turn language-switch hook from
+                                # _handle_transcriber_output — the eager path skips that
+                                # method, and without this Flux agents would never run
+                                # the switch decision on eager turns.
+                                self._spawn_language_switch_decision(transcriber_message, meta_info)
+                            self.llm_task = self.eager_llm_task
+                            self.eager_llm_task = None
+                            self.eager_meta_info = None
+                            self.eager_history_snapshot = None
+                        else:
+                            meta_info = self.__get_updated_meta_info(meta_info)
+                            await self._handle_transcriber_output(next_task, transcriber_message, meta_info)
+
+                    # Handle speech_ended notification (UtteranceEnd with no new transcript)
+                    elif isinstance(message.get("data"), dict) and message["data"].get("type", "") == "speech_ended":
+                        logger.info(f"Received speech_ended notification, resetting callee_speaking state")
+                        self.interruption_manager.on_user_speech_ended(update_utterance_time=False)
+                        self._speech_started_before_welcome = False
+                        temp_transcriber_message = ""
+
+                    elif message["data"] == "transcriber_connection_closed":
+                        self.transcriber_duration += (
+                            message.get("meta_info", {}).get("transcriber_duration", 0)
+                            if message["meta_info"] is not None
+                            else 0
+                        )
+                        # In a pool, a standby transcriber closing is expected (e.g. Deepgram
+                        # inactivity timeout). But if the active transcriber closed, the call
+                        # is over (e.g. user hung up via telephony stop event).
+                        if isinstance(self.tools.get("transcriber"), TranscriberPool):
+                            if self.tools["transcriber"].is_active_transcriber_alive():
+                                logger.info(f"TranscriberPool: standby transcriber closed, continuing")
+                                continue
+                            # The active socket can die mid-call (sarvam drops connections
+                            # within seconds — QA calls disconnected 3-9s after a language
+                            # switch). Reconnect in place; end the call only when it is
+                            # already over (real hangup) or the reconnect fails.
+                            if (
+                                not (self.conversation_ended or self.hangup_triggered)
+                                and await self.tools["transcriber"].reconnect_active()
+                            ):
+                                continue
+                            logger.info(f"TranscriberPool: active transcriber closed, ending call")
+                        await self._log_transcriber_connection_error(
+                            (message.get("meta_info") or {}).get("connection_error")
+                        )
+                        break
+
+                else:
+                    logger.info(f"Processing http transcription for message {message}")
+                    if message["data"] == "transcriber_connection_closed":
+                        self.transcriber_duration += (
+                            message.get("meta_info", {}).get("transcriber_duration", 0)
+                            if message["meta_info"] is not None
+                            else 0
+                        )
+                        if isinstance(self.tools.get("transcriber"), TranscriberPool):
+                            if self.tools["transcriber"].is_active_transcriber_alive():
+                                logger.info(f"TranscriberPool: standby transcriber closed, continuing")
+                                continue
+                            # The active socket can die mid-call (sarvam drops connections
+                            # within seconds — QA calls disconnected 3-9s after a language
+                            # switch). Reconnect in place; end the call only when it is
+                            # already over (real hangup) or the reconnect fails.
+                            if (
+                                not (self.conversation_ended or self.hangup_triggered)
+                                and await self.tools["transcriber"].reconnect_active()
+                            ):
+                                continue
+                            logger.info(f"TranscriberPool: active transcriber closed, ending call")
+                        await self._log_transcriber_connection_error(
+                            (message.get("meta_info") or {}).get("connection_error")
+                        )
+                        break
+
+                    await self.__process_http_transcription(message)
+
+        except websockets.exceptions.ConnectionClosedOK:
+            # Normal WebSocket closure (code 1000)
+            pass
+        except Exception as e:
+            provider = self.task_config["tools_config"]["transcriber"].get("provider")
+            await self._end_call_on_component_error(
+                TranscriberError(str(e), provider=provider), HangupReason.TRANSCRIBER_ERROR
+            )
+            raise TranscriberError(str(e), provider=provider) from e
+
+    async def __process_http_transcription(self, message):
+        meta_info = self.__get_updated_meta_info(message["meta_info"])
+
+        sequence = message["meta_info"].get("sequence", 0)
+        next_task = self._get_next_step(sequence, "transcriber")
+        self.transcriber_duration += (
+            message["meta_info"]["transcriber_duration"] if "transcriber_duration" in message["meta_info"] else 0
+        )
+
+        await self._handle_transcriber_output(next_task, message["data"], meta_info)
+
+    #################################################################
+    # Synthesizer task
+    #################################################################
+    def __enqueue_chunk(self, chunk, i, number_of_chunks, meta_info):
+        meta_info["chunk_id"] = i
+        copied_meta_info = copy.deepcopy(meta_info)
+        if i == 0 and "is_first_chunk" in meta_info and meta_info["is_first_chunk"]:
+            logger.info("Sending first chunk")
+            copied_meta_info["is_first_chunk_of_entire_response"] = True
+
+        if i == number_of_chunks - 1 and (
+            meta_info["sequence_id"] == -1 or meta_info.get("end_of_synthesizer_stream", False)
+        ):
+            logger.info(f"Sending first chunk")
+            copied_meta_info["is_final_chunk_of_entire_response"] = True
+            copied_meta_info.pop("is_first_chunk_of_entire_response", None)
+
+        if copied_meta_info.get("message_category", None) in ("agent_welcome_message", "handoff"):
+            # Single-chunk preloaded audio is both the first and final chunk.
+            copied_meta_info["is_first_chunk_of_entire_response"] = True
+            copied_meta_info["is_final_chunk_of_entire_response"] = True
+
+        self.buffered_output_queue.put_nowait(create_ws_data_packet(chunk, copied_meta_info))
+        if self.output_task is None or self.output_task.done():
+            self.output_task = asyncio.create_task(self.__process_output_loop())
+
+    def is_sequence_id_in_current_ids(self, sequence_id):
+        """Check if sequence_id is valid. Delegates to InterruptionManager."""
+        return self.interruption_manager.is_valid_sequence(sequence_id)
+
+    def _collect_flux_lid_events(self) -> list:
+        """Collect flux_lid_events from the transcriber or all transcribers in a pool."""
+        t = self.tools.get("transcriber")
+        if isinstance(t, TranscriberPool):
+            events = []
+            for transcriber in t.transcribers.values():
+                events.extend(getattr(transcriber, "flux_lid_events", []))
+            return events
+        return list(getattr(t, "flux_lid_events", []))
+
+    def __language_switch_enabled(self) -> bool:
+        """Per-call gate for LLM-driven language switching (controlled rollout).
+
+        Single source of truth: tools_config["llm_language_switch"], set per call
+        by dashboard-backend from the LANGUAGE_SWITCH/llm_language_switch feature
+        flag (user- or org-level grant). Truthy → new flow (unbiased detector +
+        Switch LLM); false/absent → legacy flow (switch tool + LID heuristic).
+        """
+        return bool(self.task_config.get("tools_config", {}).get("llm_language_switch"))
+
+    def _spawn_language_switch_decision(self, transcriber_message: str, meta_info: dict) -> asyncio.Task | None:
+        """Fire the once-per-turn language-switch decision as a background task.
+
+        Single home for the hook so the turn-boundary and eager call sites can't
+        drift: snapshots meta_info once (it doubles as the idle-flush follow-up
+        template) and spawns the decision. No-op when switching isn't gated on.
+        """
+        if self.language_switcher is None:
+            return None
+        snapshot = dict(meta_info)
+        self._last_turn_meta_info = snapshot
+        return asyncio.create_task(
+            self.handle_language_switch(transcriber_message, snapshot, spawn_language=self.language)
+        )
+
+    def __detector_language_mismatch(self) -> bool:
+        """True when the unbiased detector tagged the buffered turn as a language other
+        than the active one and both pools support it — a switch decision is likely to
+        land, so the main reply should wait for it."""
+        pool = self.tools.get("transcriber")
+        if not isinstance(pool, TranscriberPool):
+            return False
+        detected = pool.lid_buffer_language()
+        active_short = (self.language or "").split("-")[0].lower()
+        if not detected or detected == active_short or detected not in pool.labels:
+            return False
+        # Same substance bar the decide gates on: acknowledgment-length mis-tags end in
+        # gated:short_audio anyway, so don't cost the caller the settle+decide hold.
+        # (An explicit short by-name request still switches — via truncate, not hold.)
+        min_segment_s = float(os.getenv("LANGUAGE_SWITCH_MIN_SEGMENT_AUDIO_S", "1.0"))
+        if pool.lid_buffer_max_segment_seconds() < min_segment_s:
+            return False
+        synth = self.tools.get("synthesizer")
+        return not isinstance(synth, SynthesizerPool) or detected in synth.labels
+
+    async def __run_llm_after_switch_decision(self, transcriber_package, decision_task, spawn_language):
+        """Hold the main reply while the switch decision resolves. Switched → drop the
+        reply (the switch's follow-up answers in the new language); stayed, timed out,
+        or switched via the in-flight-tool branch (which produces no follow-up) → run
+        it. Shielded so cancelling the held reply never kills the decide."""
+        # Hold must outlast the decide budget (settle + decide timeout + lock/overhead) — a
+        # shorter hold releases the old-language reply that the confirmed switch then truncates
+        # mid-sentence. Default is derived from that budget; the env still overrides.
+        decide_budget = (
+            int(os.getenv("LANGUAGE_SWITCH_SETTLE_MS", "300")) / 1000
+            + float(os.getenv("LANGUAGE_SWITCH_DECIDE_TIMEOUT_S", "8"))
+            + 1.0
+        )
+        hold_timeout = float(os.getenv("LANGUAGE_SWITCH_MISMATCH_HOLD_S", str(decide_budget)))
+        timed_out = False
+        try:
+            await asyncio.wait_for(asyncio.shield(decision_task), timeout=hold_timeout)
+        except asyncio.TimeoutError:
+            timed_out = True
+            logger.info(f"LanguageSwitcher: mismatch hold timed out after {hold_timeout}s — playing reply")
+        except asyncio.CancelledError:
+            # Distinguish the decide being cancelled (fall through and reply) from the
+            if not decision_task.cancelled():
+                raise
+            logger.info("LanguageSwitcher: decide cancelled during hold — playing reply")
+        if self.language != spawn_language and not self.function_call_in_flight:
+            logger.info(
+                f"LanguageSwitcher: dropped held reply — language switched '{spawn_language}' → '{self.language}'"
+            )
+            self.__record_lid_event(
+                {"type": "reply_hold", "outcome": "dropped", "from": spawn_language, "to": self.language}
+            )
+            self.response_in_pipeline = False
+            return
+        if timed_out:
+            self.__record_lid_event({"type": "reply_hold", "outcome": "timeout", "from": spawn_language})
+        await self._run_llm_task(transcriber_package)
+
+    def __record_lid_event(self, record: dict) -> None:
+        """Append a metrics record to the pool's lid_detection_events (persisted to
+        lid_shadow_events JSONB) so new switch behaviors are measurable, not log-only."""
+        pool = self.tools.get("transcriber")
+        if isinstance(pool, TranscriberPool):
+            record["ts"] = time.time()
+            pool.lid_detection_events.append(record)
+
+    async def handle_language_switch(
+        self,
+        active_transcript: str = "",
+        meta_info: dict | None = None,
+        spawn_language: str | None = None,
+        speculate: bool = False,
+    ) -> None:
+        """Decide + apply a language switch from BOTH transcripts of the current turn.
+
+        Fired once per conversational turn (from _handle_transcriber_output or the eager
+        Flux path), or by the idle-flush watcher with no arguments when the locked ASR
+        couldn't decode the caller's speech and no main turn fired. Feeds the Switch LLM
+        both the unbiased detector transcript (drained from the pool buffer) and the live
+        language-locked transcript (active_transcript). The model returns a per-language
+        confidence distribution + a target; we switch if the target is supported by BOTH
+        pools, ≠ the current language, and clears LANGUAGE_SWITCH_MIN_CONFIDENCE.
+
+        On a switch, the locked-pool transcript of this turn is garbled (wrong-language
+        ASR) or absent, so after switching we put the unbiased detector transcript into
+        conversation history (replacing the garbled turn, or appending it in the
+        idle-flush case) and spawn a follow-up response — the agent then answers what
+        the caller actually said, in the new language.
+
+        Decisions are serialized via language_switch_lock — background-only, the
+        caller-facing ASR→LLM→TTS pipeline never waits on it; worst case a second
+        decision queues ~2s behind the first.
+        """
+        spec = None
+        try:
+            try:
+                async with self.language_switch_lock:
+                    followup = await self.__run_language_switch(active_transcript, meta_info, spawn_language, speculate)
+            finally:
+                # Claim our own spec task while the lock is still effectively ours (no await
+                spec = self._spec_followup_task
+                self._spec_followup_task = None
+            # Generate outside the lock (streamed, multi-second). A later confirmed switch
+            if followup is not None:
+                await self.__generate_switch_followup(*followup)
+        except Exception as e:
+            logger.error(f"LanguageSwitcher: handler error: {e}\n{traceback.format_exc()}")
+        finally:
+            # Discard any unconsumed speculative generation — covers every exit path
+            # (stay decisions, gate rejections, timeouts, exceptions) without littering
+            # the run with per-return cancels.
+            if spec is not None and not spec.done():
+                spec.cancel()
+                logger.info("LanguageSwitcher: speculative follow-up discarded")
+
+    async def __lid_idle_watcher(self):
+        """Recover the stuck-language deadlock.
+
+        The switch decision normally fires at the main transcriber's turn boundary —
+        but a language-locked ASR yields NO turn for speech it can't decode, so the
+        decision would never run and the agent stays stuck. The unbiased detector still
+        hears that speech: if its buffer has content that has gone idle (caller finished
+        speaking) and no main turn drained it within the threshold, run the decision on
+        the buffered transcript.
+        """
+        idle_flush_s = float(os.getenv("LANGUAGE_SWITCH_IDLE_FLUSH_S", "2.0"))
+        # When saaras has already tagged the buffered speech as a DIFFERENT language
+        # than the active one, the long accumulate window is pointless caution — the
+        # mismatch itself is the signal. Use a shorter threshold (still above typical
+        # 0.3-0.8s inter-segment gaps so we don't fire mid-utterance).
+        mismatch_idle_flush_s = float(os.getenv("LANGUAGE_SWITCH_MISMATCH_IDLE_FLUSH_S", "1.2"))
+        # N consecutive same-language mismatch segments fire the decision with no idle
+        # wait at all (saaras has double-confirmed the language). 0/negative disables.
+        mismatch_streak_fire = int(os.getenv("LANGUAGE_SWITCH_MISMATCH_STREAK", "2"))
+        if mismatch_streak_fire <= 0:
+            mismatch_streak_fire = 10**9
+        try:
+            while not self.conversation_ended:
+                # No switches once hangup / end-call / transfer is underway — a switch here
+                # truncates the goodbye and deadlocks teardown. Just as important: on these states
+                # __run_language_switch abandons the decision PRE-drain (the _should_ignore check
+                # below its entry), leaving the aged detector buffer intact and >= threshold. Without
+                # this guard the fire branch below would re-invoke the decision every iteration with
+                # no awaiting yield — a synchronous spin that pegs and blocks the pod's event loop,
+                # starving co-tenant calls of media/TTS (Jul 2026 transcript-missing incident).
+                if self._should_ignore_transcriber_input():
+                    await asyncio.sleep(0.5)
+                    continue
+                pool = self.tools.get("transcriber")
+                if not isinstance(pool, TranscriberPool):
+                    await asyncio.sleep(0.5)
+                    continue
+                if self._pending_switch_turn is not None:
+                    # A silent switch is awaiting its turn/fallback (≤2s window) — the
+                    # buffered segments are the tail the compose hook or fallback will
+                    # consume. Draining here would feed them to a decide() that says
+                    # "stay" (language already matches) and discard the text.
+                    await asyncio.sleep(0.25)
+                    continue
+                age = pool.lid_buffer_age()
+                if age is None:
+                    # Nothing buffered — sleep until speech actually arrives (event set
+                    # on each detector segment) instead of polling. The timeout keeps
+                    # the conversation_ended check alive and covers backends without
+                    # the event (feature is inert on those anyway).
+                    buffer_event = pool.lid_buffer_event()
+                    if buffer_event is None:
+                        await asyncio.sleep(0.5)
+                        continue
+                    try:
+                        await asyncio.wait_for(buffer_event.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
+                buffered_lang = pool.lid_buffer_language()
+                active_short = (self.language or "").split("-")[0].lower()
+                mismatch = bool(buffered_lang) and buffered_lang != active_short
+                threshold = mismatch_idle_flush_s if mismatch else idle_flush_s
+                # Two consecutive segments tagged with the SAME mismatched language are
+                # a saaras double-confirmation — fire immediately instead of waiting out
+                # the idle window. A partial-utterance decide defaults to "stay" and any
+                # follow-on speech triggers another (cheap) decision, so the risk is the
+                # cost of one extra LLM call, not a wrong switch.
+                streak_fired = mismatch and pool.lid_buffer_language_streak() >= mismatch_streak_fire
+                if streak_fired:
+                    threshold = 0.0
+                if age >= threshold:
+                    logger.info(
+                        f"LanguageSwitcher: idle-flush — detector speech idle {age:.1f}s with no main turn "
+                        f"(buffered_lang={buffered_lang!r}, active={self.language!r}, threshold={threshold}s, "
+                        f"streak_fired={streak_fired}); running switch decision"
+                    )
+                    # Streak fires are saaras double-confirmations — high enough precision
+                    # to also start the follow-up generation speculatively.
+                    await self.handle_language_switch(spawn_language=self.language, speculate=streak_fired)
+                    # Spin-guard: a healthy decision drains the buffer (age → None) and the loop
+                    # parks on the buffer event next iteration. If it returned WITHOUT draining
+                    # (e.g. an ignore-input flag flipped after the loop-top guard), the buffer stays
+                    # >= threshold and we would re-fire immediately with no yield. Force one so the
+                    # loop can never busy-spin the event loop, whatever the return path.
+                    if pool.lid_buffer_age() is not None:
+                        await asyncio.sleep(0.1)
+                    continue
+                # Buffered but not idle long enough — sleep the remaining time, but wake
+                # IMMEDIATELY if a new segment lands (clear-then-wait on the buffer event):
+                # that's what lets the streak rule fire mid-turn, the instant the second
+                # same-language segment arrives, instead of after this sleep expires.
+                remaining = max(threshold - age, 0.05)
+                buffer_event = pool.lid_buffer_event()
+                if buffer_event is None:
+                    await asyncio.sleep(remaining)
+                    continue
+                buffer_event.clear()
+                try:
+                    await asyncio.wait_for(buffer_event.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"LanguageSwitcher: idle watcher error: {e}\n{traceback.format_exc()}")
+
+    async def __run_language_switch(
+        self,
+        active_transcript: str,
+        meta_info: dict | None,
+        spawn_language: str | None = None,
+        speculate: bool = False,
+    ) -> tuple | None:
+        if not self.language_switcher:
+            return
+        # Abandon if the call is ending/transferring: a switch here truncates the goodbye
+        if self.conversation_ended or self._should_ignore_transcriber_input():
+            logger.info("LanguageSwitcher: hangup/transfer/teardown in progress — abandoning switch (pre-decide)")
+            return None
+        pool = self.tools.get("transcriber")
+        if not isinstance(pool, TranscriberPool):
+            return
+        labels = pool.labels
+        if len(labels) < 2:
+            return
+
+        # Stale-decision guard: if the language changed while this decision waited on
+        # the lock, its inputs are invalid — the LIVE transcript and buffered detector
+        # speech were produced by the PRE-switch recognizer, but the prompt would label
+        # them as the new language's output. Acting on that mislabeled context is what
+        # caused the mr→hi→mr ping-pong in QA call 1a16da82 (the model saw clean
+        # Marathi attributed to the "hi-locked" ASR and switched back). Drop the
+        # decision and discard the stale buffered speech with it.
+        if spawn_language is not None and spawn_language != self.language:
+            discarded, _ = pool.take_lid_transcript()
+            logger.info(
+                f"LanguageSwitcher: language changed since capture ('{spawn_language}' → '{self.language}') — "
+                f"dropping stale decision (discarded buffer={discarded[:60]!r})"
+            )
+            return None
+
+        # The unbiased detector is a separate socket with its own latency, so at this
+        # (main transcriber's) turn boundary its buffer may still be missing the tail of
+        # this turn. Let it settle briefly so we drain a complete turn rather than a
+        # partial one. This runs in a background task while the main LLM already answers,
+        # so the delay never blocks the caller-facing pipeline. Skipped on the idle-flush
+        # path (no active_transcript): the buffer is already ≥ the idle threshold old, so
+        # settling would only extend the lock hold for nothing.
+        settle_ms = int(os.getenv("LANGUAGE_SWITCH_SETTLE_MS", "300"))
+        if settle_ms > 0 and active_transcript:
+            await asyncio.sleep(settle_ms / 1000)
+
+        buffered_max_segment_s = pool.lid_buffer_max_segment_seconds()
+        # Peek confidence + segments before take_lid_transcript() drains the buffer.
+        detector_lang_confidence = pool.lid_buffer_language_confidence()
+        detector_segments = pool.lid_buffer_segments()
+        detector_transcript, detected_lang = pool.take_lid_transcript()
+        if not detector_transcript:
+            return
+        # One selection, used by BOTH the speculative copy and the real history append —
+        idle_flush_user_text = trailing_utterance_text(detector_segments) or detector_transcript
+        active = self.language
+
+        # Speculative follow-up: generate the reply on the main LLM in parallel with the
+        spec_task = None
+        spec_target = None
+        # Speculation runs generate() concurrently with any in-flight main generation
+        # on the SAME agent instance. Only simple_llm_agent is reentrant-safe (per-call
+        # local state); graph/custom agents mutate shared routing state
+        # (current_node_id, node_history) and would corrupt under concurrency.
+        spec_agent_type = self.task_config["tools_config"]["llm_agent"].get("agent_type", "simple_llm_agent")
+        if (
+            spec_agent_type == "simple_llm_agent"
+            and detected_lang
+            and detected_lang != active
+            and detected_lang in labels
+            and detected_lang in self.multilingual_prompts
+        ):
+            spec_synth = self.tools.get("synthesizer")
+            if not isinstance(spec_synth, SynthesizerPool) or detected_lang in spec_synth.labels:
+                spec_target = detected_lang
+                spec_task = asyncio.create_task(
+                    self.__speculative_followup_text(
+                        spec_target, detector_transcript, active_transcript, idle_flush_user_text
+                    )
+                )
+                self._spec_followup_task = spec_task
+                logger.info(f"LanguageSwitcher: speculative follow-up started for '{spec_target}'")
+
+        # Telemetry: record EVERY Switch-LLM firing (switch, stay, or gated) into the
+        # pool's lid_detection_events list — surfaced in task_output and persisted by the
+        # backend into lid_shadow_events.lid_detection_events (JSONB). That column is
+        # empty in the LLM-driven flow, so we reuse it (no schema change); a
+        # "flow":"llm_switch" discriminator keeps these records distinct from the legacy
+        # heuristic shape for aggregation. Captures fired-time, decide latency, BOTH ASR
+        # transcripts (unbiased detector + locked main), the decision, the outcome, and
+        # the context note + timestamp handed to the main LLM.
+        decide_started_at = time.time()
+        decision = None
+
+        def emit_lid_decision(outcome, switched_to=None, context_note=None, inflight_activity=None):
+            # pool is a confirmed TranscriberPool here (guarded at function entry).
+            # Snapshot the in-flight response now unless the caller passed a pre-truncation
+            activity = inflight_activity if inflight_activity is not None else self._inflight_response_activity()
+            pool.lid_detection_events.append(
+                build_lid_decision_record(
+                    outcome=outcome,
+                    fired_at=decide_started_at,
+                    now=time.time(),
+                    speculate=speculate,
+                    active_transcript=active_transcript,
+                    active=active,
+                    detector_transcript=detector_transcript,
+                    detector_lang_tag=detected_lang,
+                    detector_lang_confidence=detector_lang_confidence,
+                    detector_segments=detector_segments,
+                    decision=decision,
+                    buffered_max_segment_s=buffered_max_segment_s,
+                    speculation_started=spec_task is not None,
+                    switched_to=switched_to,
+                    context_note=context_note,
+                    inflight_activity=activity,
+                )
+            )
+
+        # Timeout strictly around the LLM call (NOT the switch itself — cancelling
+        # mid-switch could leave the pools half-switched). The litellm default is
+        # minutes; a hung decide would hold language_switch_lock that entire time,
+        # silently killing switching for the rest of the call. Timeout = no decision
+        # = stay (fail-safe), and wait_for cancels the underlying request.
+        decide_timeout_s = float(os.getenv("LANGUAGE_SWITCH_DECIDE_TIMEOUT_S", "8"))
+        try:
+            decision = await asyncio.wait_for(
+                self.language_switcher.decide(detector_transcript, active_transcript, active),
+                timeout=decide_timeout_s,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"LanguageSwitcher: decide() timed out after {decide_timeout_s}s — skipping decision, lock released"
+            )
+            emit_lid_decision("timeout")
+            return None
+        if not decision:
+            emit_lid_decision("no_decision")
+            return
+        # decide() can take seconds; a hangup/transfer may have started meanwhile — re-check
+        if self.conversation_ended or self._should_ignore_transcriber_input():
+            logger.info("LanguageSwitcher: hangup/transfer/teardown in progress — abandoning switch (post-decide)")
+            emit_lid_decision("gated:hangup")
+            return None
+        target = decision.get("target_language")
+        reasoning = (decision.get("reasoning") or "").strip()
+        languages = decision.get("languages") or []
+
+        # Re-read the live language: a prior turn's decision may have switched during
+        # this (~1-2s) LLM call, so compare against the current language, not the snapshot.
+        current = self.language
+        if not target or target == current:
+            logger.info(
+                f"LanguageSwitcher: stay on '{current}' (detected_lang={detected_lang}, langs={languages}, reason={reasoning})"
+            )
+            emit_lid_decision("stay")
+            return
+        if target not in labels:
+            logger.info(
+                f"LanguageSwitcher: target '{target}' not supported by agent {labels} — logged, no switch "
+                f"(detector={detector_transcript[:60]!r})"
+            )
+            emit_lid_decision("gated:unsupported")
+            return
+        # The synthesizer pool must also have this language — otherwise switch_language
+        # would flip the transcriber and then fail on the voice, leaving the agent
+        # half-switched (new-language ears, old-language mouth).
+        synth_pool = self.tools.get("synthesizer")
+        if isinstance(synth_pool, SynthesizerPool) and target not in synth_pool.labels:
+            logger.info(
+                f"LanguageSwitcher: target '{target}' has no synthesizer voice configured "
+                f"(synth labels={synth_pool.labels}) — no switch"
+            )
+            emit_lid_decision("gated:no_synth")
+            return
+
+        # Confidence gate (fail-closed): missing/low confidence → stay. 0.8 threshold —
+        min_conf = float(os.getenv("LANGUAGE_SWITCH_MIN_CONFIDENCE", "0.8"))
+
+        def as_float(value):
+            # LLM JSON can drift (e.g. "0.78" as a string); unparseable → None,
+            # which the gate below treats as below-threshold (fail-closed) instead
+            # of crashing the decision on a TypeError.
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        target_conf = as_float(decision.get("target_confidence"))
+        if target_conf is None:
+            short_target = (target or "").split("-")[0].lower()
+            target_conf = as_float(
+                next(
+                    (
+                        lang.get("confidence")
+                        for lang in languages
+                        if isinstance(lang, dict)
+                        and str(lang.get("language") or "").split("-")[0].lower() == short_target
+                    ),
+                    None,
+                )
+            )
+        if target_conf is None or target_conf < min_conf:
+            logger.info(
+                f"LanguageSwitcher: target '{target}' confidence {target_conf} below {min_conf} (or missing) — "
+                f"no switch (reason={reasoning})"
+            )
+            emit_lid_decision("gated:low_confidence")
+            return
+
+        # Substance gate: acknowledgment-length audio mis-tags languages. Short turns need
+        min_segment_s = float(os.getenv("LANGUAGE_SWITCH_MIN_SEGMENT_AUDIO_S", "1.0"))
+        explicit_min_conf = float(os.getenv("LANGUAGE_SWITCH_EXPLICIT_MIN_CONFIDENCE", "0.8"))
+        explicit_bypass = bool(decision.get("explicit_request")) and (target_conf or 0.0) >= explicit_min_conf
+        if not explicit_bypass and buffered_max_segment_s < min_segment_s:
+            logger.info(
+                f"LanguageSwitcher: target '{target}' but longest segment "
+                f"{buffered_max_segment_s:.2f}s < {min_segment_s}s and no confident explicit request "
+                f"(explicit={decision.get('explicit_request')}, conf={target_conf}) — "
+                f"no switch (short audio is unreliable LID evidence; reason={reasoning})"
+            )
+            emit_lid_decision("gated:short_audio")
+            return
+
+        # Truncate the in-flight old-language reply (barge-in cleanup) before switching.
+        activity = self._inflight_response_activity()  # captured pre-truncation for telemetry
+        if self.function_call_in_flight:
+            logger.info("LanguageSwitcher: in-flight function call — switching in parallel, not truncating the action")
+            if target != self.language:
+                context_note = self.__switch_context_note(target, detector_transcript, reasoning)
+                await self.switch_language(target, triggered_by="lid_llm", context_note=context_note)
+                emit_lid_decision("switched", switched_to=target, context_note=context_note, inflight_activity=activity)
+            else:
+                emit_lid_decision("gated:concurrent_switch", inflight_activity=activity)
+            return None
+
+        if any(activity.values()):
+            logger.info(f"LanguageSwitcher: truncating in-flight old-language response before switch ({activity})")
+            await self.__cleanup_downstream_tasks()
+
+        # Re-read after the truncate: a concurrent decision may have switched while we
+        # were clearing, so re-check against the live language before applying.
+        current = self.language
+        if target == current:
+            emit_lid_decision("gated:concurrent_switch", inflight_activity=activity)
+            return
+
+        context_note = self.__switch_context_note(target, detector_transcript, reasoning)
+        logger.info(
+            f"LanguageSwitcher: switching '{current}' → '{target}' (confidence={target_conf}, langs={languages}, reason={reasoning})"
+        )
+        await self.switch_language(target, triggered_by="lid_llm", context_note=context_note)
+        emit_lid_decision("switched", switched_to=target, context_note=context_note, inflight_activity=activity)
+
+        # Mid-speech silent switch (streak-fired fast path): a FRESH detector segment
+        # (<1s old) has landed since the decision drained the buffer — the caller is
+        # still actively talking. Replying now would answer half an utterance and get
+        # barged, so switch silently and let the turn finish on the now-correct ASR.
+        # When that turn fires, _handle_transcriber_output swaps its tail-only text
+        # for the FULL unbiased transcript (this prefix + post-switch detector
+        # segments). The 2s fallback guarantees a reply if the caller stops at the
+        # boundary. A STALE buffer (caller finished during the ~2s decide) must NOT
+        # suppress — that would trade today's immediate reply for the fallback's 2s
+        # wait. The unconsumed speculation is discarded by the caller's finally.
+        post_drain_age = pool.lid_buffer_age()
+        if speculate and post_drain_age is not None and post_drain_age < 1.0:
+            self._pending_switch_turn = {
+                "prefix": detector_transcript,
+                "target": target,
+                "segments": detector_segments,
+            }
+            if self._post_switch_fallback_task is not None and not self._post_switch_fallback_task.done():
+                self._post_switch_fallback_task.cancel()
+            self._post_switch_fallback_task = asyncio.create_task(self.__post_switch_reply_fallback())
+            logger.info(
+                f"LanguageSwitcher: caller still speaking — silent switch to '{target}', awaiting turn "
+                f"completion (prefix={detector_transcript[:60]!r})"
+            )
+            return None
+
+        # Put the caller's actual words into conversation history. Turn-boundary path:
+        # the locked-pool ASR garbled this turn, so replace it with the unbiased
+        # transcript — guarded on the original content so a newer turn that arrived
+        # during the decision is never overwritten. Idle-flush path: the locked ASR
+        # produced no turn at all, so append the detector transcript as the user turn.
+        transcript_corrected = True
+        if active_transcript:
+            replaced = self.conversation_history.replace_last_user(active_transcript, detector_transcript)
+            if not replaced:
+                # A newer turn landed during decide; the truncate cancelled its generation,
+                transcript_corrected = False
+                logger.info(
+                    "LanguageSwitcher: newer user turn arrived during decision — skipping transcript "
+                    "correction, generating follow-up for the latest turn"
+                )
+            else:
+                logger.info(
+                    f"LanguageSwitcher: corrected user turn to detector transcript {detector_transcript[:80]!r}"
+                )
+        else:
+            # Reply to the caller's LAST utterance, not the whole buffer — with the
+            self.conversation_history.append_user(idle_flush_user_text)
+            logger.info(
+                f"LanguageSwitcher: idle-flush — appended detector transcript as user turn {idle_flush_user_text[:80]!r}"
+            )
+
+        # Handoff first (no-op if none configured), then the reply — it masks the
+        # reply-generation gap when the speculative follow-up isn't ready yet.
+        await self.__play_switch_handoff(target)
+
+        # Commit the speculative follow-up if it matches the confirmed target — it has
+        # been generating throughout the decide, so it's ready or nearly ready now.
+        # Not when a newer turn superseded the transcript it was generated against:
+        # the speculation answers stale content, so fall through to fresh generation
+        # (the caller's finally discards the unconsumed task).
+        if spec_task is not None and spec_target == target and transcript_corrected:
+            spec_text = ""
+            try:
+                spec_text = await asyncio.wait_for(spec_task, timeout=6.0)
+            except asyncio.CancelledError:
+                # Always re-raise: wait_for cancels spec_task BEFORE raising, so a
+                # cancelled spec_task is the signature of THIS handler being cancelled
+                # (teardown) — swallowing it would keep a cancelled handler running.
+                # The timeout fallback is the separate TimeoutError path below.
+                raise
+            except asyncio.TimeoutError:
+                logger.info("LanguageSwitcher: speculative follow-up timed out — falling back")
+            except Exception as e:
+                logger.info(f"LanguageSwitcher: speculative follow-up unavailable ({e!r}) — falling back")
+            self._spec_followup_task = None
+            # The spec await above can straddle a hangup; re-check so we don't truncate the goodbye.
+            if self.hangup_triggered or self.conversation_ended:
+                logger.info("LanguageSwitcher: hangup during speculation — not speaking follow-up")
+                return None
+            if spec_text:
+                self.conversation_history.append_assistant(spec_text)
+                synth_meta = {
+                    "io": self.tools["output"].get_provider(),
+                    "request_id": str(uuid.uuid4()),
+                    "cached": False,
+                    "sequence_id": -1,
+                    "format": "pcm",
+                    "message_category": "language_switch_followup",
+                    "end_of_llm_stream": True,
+                }
+                logger.info(
+                    f"LanguageSwitcher: speaking speculative follow-up ({len(spec_text)} chars) — "
+                    f"decide latency hidden behind generation"
+                )
+                await self._synthesize(create_ws_data_packet(spec_text, meta_info=synth_meta))
+                return None
+            # Empty text (tool-call abort / generation error) — fall through to the
+            # normal follow-up below (the handoff already played above).
+
+        # Prepare the follow-up that answers what the caller actually said, in the new
+        # language (generated by the caller AFTER the lock is released).
+        return self.__prepare_followup_generation(meta_info)
+
+    def __prepare_followup_generation(self, meta_info=None):
+        """Build (messages, followup_meta_info, next_step) for a switch follow-up.
+
+        Mirrors the legacy switch tool's follow-up. In the idle-flush case there is
+        no turn meta_info, so the most recent turn's is reused as a template — fine
+        because _spawn_followup_meta_info allocates a fresh sequence_id/turn_id
+        anyway. Shared by __run_language_switch and __post_switch_reply_fallback.
+        """
+        if meta_info is None and self._last_turn_meta_info is not None:
+            meta_info = dict(self._last_turn_meta_info)
+        if meta_info is None:
+            # First-utterance switch: the locked ASR never completed a turn, so no
+            # template exists. Fall back to the transcriber's meta_info — the same
+            # base __get_updated_meta_info(None) uses for other silence-driven
+            # responses. Without this the agent switches and then sits silent until
+            # the user-online check fires (QA call f338090b: switch → 11s silence →
+            # "are you still there" → hangup).
+            pool = self.tools.get("transcriber")
+            meta_info = dict((pool.get_meta_info() if pool is not None else None) or {})
+            logger.info("LanguageSwitcher: no turn meta_info template — using transcriber meta_info for follow-up")
+        if self.conversation_ended or self.hangup_triggered:
+            return None
+        messages = self.conversation_history.get_copy()
+        followup_meta_info = self._spawn_followup_meta_info(meta_info)
+        # A transcriber-meta template has no response_uid lineage, which would leave
+        # response_group_uid None — re-anchor it to the freshly allocated response_uid.
+        if not followup_meta_info.get("response_group_uid"):
+            followup_meta_info["response_group_uid"] = followup_meta_info.get("response_uid")
+        next_step = self._get_next_step(meta_info.get("sequence", 0), "llm")
+        return messages, followup_meta_info, next_step
+
+    async def __post_switch_reply_fallback(self):
+        """Safety net for the mid-speech silent switch.
+
+        If the caller stopped speaking right at the switch boundary, the newly
+        activated ASR may never emit a tail turn — and the switch path suppressed
+        its own reply, so nobody would answer (the 746c08f1 'switched but no
+        response' class). After 2s with the pending state unconsumed, reply to the
+        full unbiased transcript exactly as an idle-flush switch would. A turn
+        arriving in time clears _pending_switch_turn and this no-ops.
+        """
+        try:
+            await asyncio.sleep(2.0)
+            pending = self._pending_switch_turn
+            if pending is None or self.conversation_ended or self.hangup_triggered:
+                return
+            self._pending_switch_turn = None
+            drained = ""
+            tail_segments = []
+            pool = self.tools.get("transcriber")
+            if isinstance(pool, TranscriberPool):
+                tail_segments = pool.lid_buffer_segments()
+                drained, _ = pool.take_lid_transcript()
+            full_text = " ".join(filter(None, [pending["prefix"], drained])).strip()
+            if not full_text:
+                return
+            # Reply to the caller's LAST utterance — the full buffer spans stale
+            reply_text = trailing_utterance_text(list(pending.get("segments") or []) + tail_segments) or full_text
+            self.conversation_history.append_user(reply_text)
+            logger.info(
+                f"LanguageSwitcher: no turn within 2s of silent switch — replying to last utterance "
+                f"{reply_text[:80]!r} (buffer={full_text[:60]!r})"
+            )
+            followup = self.__prepare_followup_generation()
+            if followup:
+                await self.__generate_switch_followup(*followup)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"LanguageSwitcher: post-switch fallback error: {e}\n{traceback.format_exc()}")
+
+    async def __play_switch_handoff(self, target: str) -> None:
+        """Speak the target language's handoff line (new voice, sequence_id=-1) to cover
+        the post-switch reply-generation gap."""
+        # Don't synthesize into a tearing-down pipeline (would truncate the goodbye).
+        if self.hangup_triggered or self.conversation_ended:
+            return
+        handoff_text = self.__handoff_text_for(target)
+        if not handoff_text:
+            return
+
+        handoff_meta = {
+            "io": self.tools["output"].get_provider(),
+            "request_id": str(uuid.uuid4()),
+            "sequence_id": -1,
+            "message_category": "handoff",
+            "text": handoff_text,
+        }
+        clip = self.handoff_audio_cache.get(target)
+        if clip:
+            # Pre-warmed mu-law clip pushed straight to telephony. Both end-flags required
+            handoff_meta.update(
+                {
+                    "format": "mulaw",
+                    "end_of_llm_stream": True,
+                    "end_of_synthesizer_stream": True,
+                    "is_first_chunk": True,
+                }
+            )
+            # Cached synth logs — else the spoken handoff is invisible in the run log.
+            for direction in (LogDirection.REQUEST, LogDirection.RESPONSE):
+                convert_to_request_log(
+                    message=handoff_text,
+                    meta_info=handoff_meta,
+                    component=LogComponent.SYNTHESIZER,
+                    direction=direction,
+                    model=self.synthesizer_provider,
+                    is_cached=True,
+                    engine=self.tools["synthesizer"].get_engine(),
+                    run_id=self.run_id,
+                )
+            self.__enqueue_chunk(clip, 0, 1, handoff_meta)
+            self.conversation_history.append_assistant(handoff_text)
+            self.__record_lid_event({"type": "handoff", "source": "prewarmed", "target": target})
+            logger.info(f"LanguageSwitcher: playing pre-warmed handoff clip: {handoff_text!r}")
+            return
+
+        # Cold cache → live synthesis on the target voice (socket already warm).
+        handoff_meta.update({"cached": False, "format": "pcm", "end_of_llm_stream": True})
+        await self._synthesize(create_ws_data_packet(handoff_text, meta_info=handoff_meta))
+        self.conversation_history.append_assistant(handoff_text)
+        self.__record_lid_event({"type": "handoff", "source": "live", "target": target})
+        logger.info(f"LanguageSwitcher: playing handoff to cover reply generation: {handoff_text!r}")
+
+    def __handoff_text_for(self, label):
+        template = self.switch_handoff_messages.get(label, "")
+        if not template:
+            return ""
+        return template.replace("{agent_name}", self._get_voice_name_for_label(label)).replace(
+            "{language}", LANGUAGE_NAMES.get(label, label)
+        )
+
+    async def __prewarm_handoff_clips(self):
+        """Pre-render each language's handoff on its own voice via one-shot synthesize().
+        Clips are static for the call; non-active labels first (likely first targets)."""
+        pool = self.tools.get("synthesizer")
+        if not isinstance(pool, SynthesizerPool):
+            return
+
+        async def render(label, synth):
+            text = self.__handoff_text_for(label)
+            if not text:
+                return
+            cache_key = (
+                synth.__class__.__name__,
+                getattr(synth, "voice_id", None) or getattr(synth, "voice", None),
+                text,
+            )
+            cached = HANDOFF_CLIP_CACHE.get(cache_key)
+            if cached:
+                self.handoff_audio_cache[label] = cached
+                return
+            try:
+                clip = None
+                # Prefer a native mu-law 8000 one-shot when the provider offers it.
+                telephony_one_shot = getattr(synth, "synthesize_telephony_clip", None)
+                if telephony_one_shot is not None:
+                    clip = await telephony_one_shot(text)
+                if not clip:
+                    audio = await synth.synthesize(text)
+                    if not audio:
+                        return
+                    # pydub decode shells out to ffprobe/ffmpeg — keep it off the event loop.
+                    clip = await asyncio.to_thread(self.__handoff_clip_to_mulaw, synth, audio)
+                if clip:
+                    self.handoff_audio_cache[label] = clip
+                    if len(HANDOFF_CLIP_CACHE) >= HANDOFF_CLIP_CACHE_MAX:
+                        HANDOFF_CLIP_CACHE.pop(next(iter(HANDOFF_CLIP_CACHE)))
+                    HANDOFF_CLIP_CACHE[cache_key] = clip
+                    synth.synthesized_characters = getattr(synth, "synthesized_characters", 0) + len(text)
+                    logger.info(f"LanguageSwitcher: pre-warmed handoff clip '{label}' ({len(clip)} bytes)")
+            except Exception as e:
+                logger.error(f"LanguageSwitcher: handoff prewarm failed for '{label}': {e}")
+
+        await asyncio.gather(*(render(label, synth) for label, synth in pool.synthesizers.items()))
+
+    def __handoff_clip_to_mulaw(self, synth, audio):
+        clip = audio_to_mulaw8k(
+            audio,
+            rate_hint=getattr(synth, "sampling_rate", 0) or getattr(synth, "sample_rate", 0) or 8000,
+            format_hint=getattr(synth, "format", "") or "",
+        )
+        if clip is None:
+            logger.error("LanguageSwitcher: handoff clip is a compressed container pydub can't decode — skipping")
+        return clip
+
+    def __switch_context_note(self, target: str, detector_transcript: str, reasoning: str = None) -> str:
+        """Build the language note installed in the system prompt on a switch.
+
+        Must be a DIRECTIVE, not a description: with history dominated by the old
+        language (and customer prompts often written in one language), the main LLM
+        follows conversation momentum and keeps replying in the OLD language unless
+        explicitly ordered (QA 16db0968: pipeline switched hi→en but every reply
+        stayed Hindi). Shared by the real switch path and the speculative follow-up
+        so the committed speculation obeys the same directive. The reasoning line is
+        omitted on the speculative path — the decision hasn't returned yet there.
+        """
+        target_name = LANGUAGE_NAMES.get(target, target)
+        note = (
+            f"## Language note:\nThe caller is now speaking {target_name} ('{target}'). "
+            f"From this point, respond ONLY in {target_name} — every reply must be in {target_name}, "
+            f"regardless of the language of earlier conversation turns or the language these "
+            f'instructions are written in. Their latest message: "{detector_transcript}".'
+        )
+        if reasoning:
+            note += f" Reason: {reasoning}"
+        return note
+
+    async def __speculative_followup_text(
+        self, target_label: str, detector_transcript: str, active_transcript: str = "", idle_user_text: str = ""
+    ) -> str:
+        """Generate the post-switch reply text speculatively, BEFORE the decide confirms.
+
+        Runs the agent's MAIN conversational LLM over a COPY of history with the target
+        language's system prompt and the unbiased transcript as the user turn —
+        synthesis off, so nothing is heard unless the decision confirms and the caller
+        commits this text. Real history is never touched here. Tool calls can't be
+        speculated (side effects), so a function-call chunk aborts and returns "" —
+        the caller then falls back to the normal post-switch generation.
+        """
+        messages = self.conversation_history.get_copy()
+        target_prompt = self.multilingual_prompts.get(target_label)
+        note = self.__switch_context_note(target_label, detector_transcript)
+        target_prompt = f"{target_prompt}\n\n{note}" if target_prompt else note
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = target_prompt
+        else:
+            messages.insert(0, {"role": "system", "content": target_prompt})
+        # Mirror the real path's history correction on this copy: replace the garbled
+        if active_transcript:
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "user":
+                    if messages[i].get("content", "").strip() == active_transcript.strip():
+                        messages[i] = {"role": "user", "content": detector_transcript}
+                    break
+        else:
+            # Idle-flush: the locked ASR produced no turn — append the SAME trailing-utterance
+            messages.append({"role": "user", "content": idle_user_text or detector_transcript})
+        spec_meta = {
+            "request_id": str(uuid.uuid4()),
+            "sequence_id": -1,
+            "turn_id": None,
+            "origin": "language_switch_speculation",
+        }
+        text = ""
+        async for llm_message in self.tools["llm_agent"].generate(messages, synthesize=False, meta_info=spec_meta):
+            if isinstance(llm_message, dict):
+                # pre-call request logs / routing info — irrelevant to speculation
+                continue
+            if getattr(llm_message, "is_function_call", False):
+                logger.info("LanguageSwitcher: speculative follow-up wants a tool call — aborting speculation")
+                return ""
+            if llm_message.data:
+                text += " " + llm_message.data
+            if llm_message.end_of_stream:
+                break
+        return text.strip()
+
+    async def __generate_switch_followup(self, messages, followup_meta_info, next_step):
+        """Generate the post-switch follow-up response (runs outside language_switch_lock).
+
+        No llm_task cancel here, on purpose: by this point the switch path has either
+        truncated the old turn via __cleanup_downstream_tasks (which cancelled and
+        nulled llm_task) or skipped truncation because nothing was in flight — so any
+        non-done llm_task seen here can only belong to a NEWER concurrent turn, and
+        cancelling that would kill the wrong response.
+        """
+        # Bypasses _process_conversation_task, so stamp the eager stub here to record the turn normally.
+        followup_meta_info["llm_start_time"] = time.time()
+        self._append_eager_llm_stub(followup_meta_info)
+        # Revalidate the follow-up's sequence_id — the truncate path's
+        # invalidate_pending_responses would otherwise leave its audio permanently BLOCKed.
+        self.interruption_manager.revalidate_sequence_id(followup_meta_info["sequence_id"])
+        self.response_in_pipeline = True
+        await self.__do_llm_generation(
+            messages, followup_meta_info, next_step, should_bypass_synth=False, should_trigger_function_call=True
+        )
+
+    async def switch_language(self, label, components=None, triggered_by: str = "manual", context_note: str = None):
+        """Switch the active language for multilingual pools.
+
+        Args:
+            label: language label to switch to (e.g. "hi", "en").
+            components: list of component names to switch. Defaults to both.
+            triggered_by: "manual" (legacy LLM tool call) or "lid_llm" (Switch LLM).
+                          Used in post-call telemetry.
+            context_note: optional one-line note (transcript + language + reasoning)
+                          appended to the swapped system prompt so the main LLM has
+                          context on why the language changed. Replaced on each switch.
+        """
+        components = components or ["transcriber", "synthesizer"]
+
+        # Record every switch so shadow-eval can compare LID detections vs.
+        # actual LLM-decided switches on the same call.
+        self.language_switch_events.append(
+            {
+                "to_label": label,
+                "from_label": self.language,
+                "triggered_by": triggered_by,
+                "switched_at": time.time(),
+            }
+        )
+
+        if "transcriber" in components and isinstance(self.tools.get("transcriber"), TranscriberPool):
+            await self.tools["transcriber"].switch(label)
+        if "synthesizer" in components and isinstance(self.tools.get("synthesizer"), SynthesizerPool):
+            await self.tools["synthesizer"].switch(label)
+
+        # Update TaskManager state so silence detection, fillers, and LLM
+        # language stay in sync with the active pools.
+        self.language = label
+        # Reset silence timers to prevent __check_for_completion from
+        # interpreting the switch gap as inactivity and hanging up.
+        self.last_transmitted_timestamp = time.time()
+        self.time_since_last_spoken_human_word = time.time()
+        self.asked_if_user_is_still_there = False
+        logger.info(f"Language switched to '{label}'")
+
+        # Poke the idle watcher: a switch changes the mismatch threshold for any speech
+        # already sitting in the detector buffer, so wake it to recompute instead of
+        # letting it sleep out a schedule computed for the previous language. Only when
+        # speech is actually buffered — setting the event with an empty buffer would
+        # busy-loop the watcher's empty-branch wait (it relies on unset-while-empty).
+        poke_pool = self.tools.get("transcriber")
+        if isinstance(poke_pool, TranscriberPool) and poke_pool.lid_buffer_age() is not None:
+            poke_event = poke_pool.lid_buffer_event()
+            if poke_event is not None:
+                poke_event.set()
+
+        if label in self.multilingual_prompts:
+            new_prompt = self.multilingual_prompts[label]
+            if context_note:
+                new_prompt = f"{new_prompt}\n\n{context_note}"
+            self.conversation_history.update_system_prompt(new_prompt)
+            self.system_prompt["content"] = new_prompt
+            logger.info(f"Switched system prompt to language '{label}'")
+
+        active_transcriber_info = (
+            self.tools.get("transcriber").get_active_transcriber_info()
+            if isinstance(self.tools.get("transcriber"), TranscriberPool)
+            else None
+        )
+        active_synthesizer_info = (
+            self.tools.get("synthesizer").get_active_synthesizer_info()
+            if isinstance(self.tools.get("synthesizer"), SynthesizerPool)
+            else None
+        )
+        if active_transcriber_info:
+            if "provider" in active_transcriber_info and active_transcriber_info["provider"]:
+                self.transcriber_provider = active_transcriber_info["provider"]
+
+        if active_synthesizer_info:
+            if "provider" in active_synthesizer_info and active_synthesizer_info["provider"]:
+                self.synthesizer_provider = active_synthesizer_info["provider"]
+            if "voice" in active_synthesizer_info and active_synthesizer_info["voice"]:
+                self.synthesizer_voice = active_synthesizer_info["voice"]
+
+    async def __listen_synthesizer(self):
+        all_text_to_be_synthesized = []
+        try:
+            while not self.conversation_ended:
+                logger.info("Listening to synthesizer")
+                try:
+                    async for message in self.tools["synthesizer"].generate():
+                        meta_info = message.get("meta_info", {})
+                        current_text = meta_info.get("text", "")
+                        write_to_log = False
+                        if current_text not in all_text_to_be_synthesized:
+                            all_text_to_be_synthesized.append(current_text)
+                            write_to_log = True
+
+                        is_first_message = meta_info.get("is_first_message", False)
+                        sequence_id = meta_info.get("sequence_id", None)
+
+                        # Check if the message is valid to process
+                        if is_first_message or (
+                            not self.conversation_ended and self.interruption_manager.is_valid_sequence(sequence_id)
+                        ):
+                            logger.info(f"Processing message with sequence_id: {sequence_id}")
+
+                            if self.stream:
+                                if meta_info.get("is_first_chunk", False):
+                                    first_chunk_generation_timestamp = time.time()
+                                    # is_first_chunk re-stamps on every frame once the turn's text is flushed.
+                                    _ttfb = meta_info.get("synthesizer_latency")
+                                    _tts_key = (sequence_id, _ttfb)
+                                    if _tts_key != self._cb_tts_last:
+                                        self._cb_tts_last = _tts_key
+                                        await self._report_component_health(
+                                            "synthesizer",
+                                            self.synthesizer_provider,
+                                            round(_ttfb * 1000) if _ttfb is not None else None,
+                                            "_cb_synthesizer_connect_reported",
+                                        )
+
+                                if self.tools["output"].process_in_chunks(self.yield_chunks):
+                                    number_of_chunks = math.ceil(len(message["data"]) / self.output_chunk_size)
+                                    for chunk_idx, chunk in enumerate(
+                                        yield_chunks_from_memory(message["data"], chunk_size=self.output_chunk_size)
+                                    ):
+                                        self.__enqueue_chunk(chunk, chunk_idx, number_of_chunks, meta_info)
+                                else:
+                                    self.buffered_output_queue.put_nowait(message)
+                            else:
+                                # Non-streaming output
+                                logger.info("Stream not enabled, sending entire audio")
+                                # TODO handle is audio playing over here
+                                await self.tools["output"].handle(message)
+                                if meta_info.get("end_of_synthesizer_stream", False):
+                                    self._turn_audio_flushed.set()
+
+                            if write_to_log:
+                                logger.info(f"Writing response to log {meta_info.get('text')}")
+                                convert_to_request_log(
+                                    message=current_text,
+                                    meta_info=meta_info,
+                                    component=LogComponent.SYNTHESIZER,
+                                    direction=LogDirection.RESPONSE,
+                                    model=self.synthesizer_provider,
+                                    is_cached=meta_info.get("is_cached", False),
+                                    engine=self.tools["synthesizer"].get_engine(),
+                                    run_id=self.run_id,
+                                )
+                        else:
+                            logger.info(f"Skipping message with sequence_id: {sequence_id}")
+                            # A retired sequence's final chunk is skipped here, so its
+                            # is_final_chunk mark never reaches Plivo and no mark echo ever
+                            # arrives to clear is_audio_being_played. Without this, the flag
+                            # latches True forever and every later user utterance is dropped
+                            # as a false interruption. Mirror the BLOCK-path guard.
+                            if meta_info.get("end_of_synthesizer_stream", False):
+                                self._turn_audio_flushed.set()
+                                self.tools["input"].update_is_audio_being_played(False)
+
+                        # Give control to other tasks
+                        sleep_time = self.tools["synthesizer"].get_sleep_time()
+                        await asyncio.sleep(sleep_time)
+
+                except asyncio.CancelledError:
+                    logger.info("Synthesizer task was cancelled.")
+                    # await self.handle_cancellation("Synthesizer task was cancelled.")
+                    self._turn_audio_flushed.set()
+                    break
+                except Exception as e:
+                    self._turn_audio_flushed.set()
+                    await self._end_call_on_component_error(
+                        SynthesizerError(str(e), provider=self.synthesizer_provider), HangupReason.SYNTHESIZER_ERROR
+                    )
+                    break
+
+            logger.info("Exiting __listen_synthesizer gracefully.")
+
+        except asyncio.CancelledError:
+            logger.info("Synthesizer task cancelled outside loop.")
+            # await self.handle_cancellation("Synthesizer task was cancelled outside loop.")
+        except Exception as e:
+            await self._end_call_on_component_error(
+                SynthesizerError(str(e), provider=self.synthesizer_provider), HangupReason.SYNTHESIZER_ERROR
+            )
+            raise SynthesizerError(str(e), provider=self.synthesizer_provider) from e
+        finally:
+            await self.tools["synthesizer"].cleanup()
+
+    async def __send_preprocessed_audio(self, meta_info, text):
+        meta_info = copy.deepcopy(meta_info)
+        yield_in_chunks = self.yield_chunks
+        try:
+            # TODO: Either load IVR audio into memory before call or user s3 iter_cunks
+            # This will help with interruption in IVR
+            audio_chunk = None
+            static_node_audio = meta_info.get("message_category") in ("static_node", "event_proactive")
+            if meta_info.get("message_category") == "static_node" and meta_info.get("text"):
+                # Fetch the clip keyed to the active voice/language, not text alone, so a voice
+                # change regenerates it instead of replaying the stale pre-generated clip.
+                text = static_node_audio_key(
+                    meta_info["text"],
+                    provider=self.synthesizer_provider,
+                    voice=self.synthesizer_voice,
+                    voice_id=self.synthesizer_voice_id,
+                    model=self.synthesizer_model,
+                )
+            if self.turn_based_conversation or self.task_config["tools_config"]["output"]["provider"] == "default":
+                # Static-node clips are pre-generated as mp3 keyed by md5(text); fetch that
+                # format explicitly rather than the output format, which may differ (e.g. wav).
+                audio_format = "mp3" if static_node_audio else self.task_config["tools_config"]["output"]["format"]
+                try:
+                    audio_chunk = await get_raw_audio_bytes(
+                        text,
+                        self.assistant_name,
+                        audio_format,
+                        local=self.is_local,
+                        assistant_id=self.assistant_id,
+                    )
+                except Exception as static_audio_err:
+                    if not static_node_audio:
+                        raise
+                    logger.error(f"Failed to fetch static node audio {text}: {static_audio_err}")
+                    audio_chunk = None
+                if static_node_audio and audio_chunk is None:
+                    # Cache miss or fetch failure: synthesize live so the node still speaks.
+                    logger.info("Static node audio unavailable; synthesizing live from text")
+                    meta_info["cached"] = False
+                    await self._synthesize(create_ws_data_packet(meta_info["text"], meta_info=meta_info))
+                    return
+                logger.info("Sending preprocessed audio")
+                meta_info["format"] = audio_format
+                meta_info["end_of_synthesizer_stream"] = True
+                await self.tools["output"].handle(create_ws_data_packet(audio_chunk, meta_info))
+            else:
+                if meta_info.get("message_category", None) == "filler":
+                    logger.info(f"Getting {text} filler from local fs")
+                    audio = await get_raw_audio_bytes(
+                        f"{self.filler_preset_directory}/{text}.wav", local=True, is_location=True
+                    )
+                    yield_in_chunks = False
+                    if not self.turn_based_conversation and self.task_config["tools_config"]["output"] != "default":
+                        logger.info(f"Got to convert it to pcm")
+                        audio_chunk = wav_bytes_to_pcm(resample(audio, format="wav", target_sample_rate=8000))
+                        meta_info["format"] = "pcm"
+                elif static_node_audio:
+                    logger.info(f"Getting static node audio {text} from S3")
+                    yield_in_chunks = False
+                    try:
+                        audio = await get_raw_audio_bytes(
+                            text, self.assistant_name, "mp3", assistant_id=self.assistant_id, local=self.is_local
+                        )
+                        if audio is not None:
+                            # Telephony wire format is 8k mu-law. Providers key off meta_info["format"]:
+                            # plivo/vobiz send non-wav bytes as audio/x-mulaw without converting, so raw
+                            # linear16 would play as noise. mu-law is correct across plivo/twilio/exotel.
+                            audio_chunk = audioop.lin2ulaw(mp3_bytes_to_pcm(audio, target_sample_rate=8000), 2)
+                            meta_info["format"] = "mulaw"
+                    except Exception as static_audio_err:
+                        logger.error(f"Failed to prepare static node audio {text}: {static_audio_err}")
+                    if audio_chunk is None:
+                        # Cache miss or fetch/convert failure: synthesize live so the node still speaks.
+                        logger.info("Static node audio unavailable; synthesizing live from text")
+                        meta_info["cached"] = False
+                        await self._synthesize(create_ws_data_packet(meta_info["text"], meta_info=meta_info))
+                        return
+                else:
+                    start_time = time.perf_counter()
+                    audio_chunk = self.preloaded_welcome_audio if self.preloaded_welcome_audio else None
+                    if meta_info["text"] == "":
+                        audio_chunk = None
+                    logger.info(f"Time to get response from S3 {time.perf_counter() - start_time}")
+                    if not self.buffered_output_queue.empty():
+                        logger.info(f"Output queue was not empty and hence emptying it")
+                        self.buffered_output_queue = asyncio.Queue()
+                    meta_info["format"] = "pcm"
+                    if "message_category" in meta_info and meta_info["message_category"] == "agent_welcome_message":
+                        if audio_chunk is None:
+                            logger.info(f"File doesn't exist in S3. Hence we're synthesizing it from synthesizer")
+                            meta_info["cached"] = False
+                            await self._synthesize(create_ws_data_packet(meta_info["text"], meta_info=meta_info))
+                            return
+                        else:
+                            meta_info["is_first_chunk"] = True
+                meta_info["end_of_synthesizer_stream"] = True
+                if yield_in_chunks and audio_chunk is not None:
+                    i = 0
+                    number_of_chunks = math.ceil(len(audio_chunk) / 100000000)
+                    logger.info(f"Audio chunk size {len(audio_chunk)}, chunk size {100000000}")
+                    for chunk in yield_chunks_from_memory(audio_chunk, chunk_size=100000000):
+                        self.__enqueue_chunk(chunk, i, number_of_chunks, meta_info)
+                        i += 1
+                elif audio_chunk is not None:
+                    meta_info["chunk_id"] = 1
+                    meta_info["is_first_chunk_of_entire_response"] = True
+                    meta_info["is_final_chunk_of_entire_response"] = True
+                    message = create_ws_data_packet(audio_chunk, meta_info)
+                    self.buffered_output_queue.put_nowait(message)
+
+        except Exception as e:
+            traceback.print_exc()
+            logger.error(f"Something went wrong {e}")
+
+    async def _synthesize(self, message):
+        meta_info = message["meta_info"]
+        text = message["data"]
+        meta_info["type"] = "audio"
+        meta_info["synthesizer_start_time"] = time.time()
+        meta_info["tts_start_ms"] = round(
+            meta_info["synthesizer_start_time"] * 1000 - self.conversation_start_init_ts, 2
+        )
+        try:
+            if not self.conversation_ended and (
+                "is_first_message" in meta_info
+                and meta_info["is_first_message"]
+                or self.interruption_manager.is_valid_sequence(message["meta_info"]["sequence_id"])
+            ):
+                if meta_info["is_md5_hash"]:
+                    logger.info(
+                        "sending preprocessed audio response to {}".format(
+                            self.task_config["tools_config"]["output"]["provider"]
+                        )
+                    )
+                    await self.__send_preprocessed_audio(meta_info, text)
+
+                elif self.synthesizer_provider in SUPPORTED_SYNTHESIZER_MODELS.keys():
+                    convert_to_request_log(
+                        message=text,
+                        meta_info=meta_info,
+                        component=LogComponent.SYNTHESIZER,
+                        direction=LogDirection.REQUEST,
+                        model=self.synthesizer_provider,
+                        engine=self.tools["synthesizer"].get_engine(),
+                        run_id=self.run_id,
+                    )
+                    if "cached" in message["meta_info"] and meta_info["cached"] is True:
+                        logger.info(f"Cached response and hence sending preprocessed text")
+                        convert_to_request_log(
+                            message=text,
+                            meta_info=meta_info,
+                            component=LogComponent.SYNTHESIZER,
+                            direction=LogDirection.RESPONSE,
+                            model=self.synthesizer_provider,
+                            is_cached=True,
+                            engine=self.tools["synthesizer"].get_engine(),
+                            run_id=self.run_id,
+                        )
+                        await self.__send_preprocessed_audio(meta_info, get_md5_hash(text))
+                    else:
+                        self.synthesizer_characters += len(text)
+                        await self.tools["synthesizer"].push(message)
+                else:
+                    logger.info("other synthesizer models not supported yet")
+            else:
+                logger.info(
+                    f"{message['meta_info']['sequence_id']} is not a valid sequence id and hence not synthesizing this"
+                )
+
+        except Exception as e:
+            traceback.print_exc()
+            logger.error(f"Error in synthesizer: {e}")
+            self._turn_audio_flushed.set()
+
+    ############################################################
+    # Output handling
+    ############################################################
+
+    async def __send_first_message(self, message):
+        meta_info = self.__get_updated_meta_info()
+        sequence = meta_info.get("sequence", 0)
+        next_task = self._get_next_step(sequence, "transcriber")
+        await self._handle_transcriber_output(next_task, message, meta_info)
+        self.interruption_manager.set_first_interim_for_immediate_response()
+
+    """
+    When the welcome message is playing we accumulate the transcript in the self.transcriber_message variable and once 
+    the welcome message is completely played we send this transcript for further processing.
+    """
+
+    async def __handle_accumulated_message(self):
+        logger.info("Setting up __handle_accumulated_message function")
+        while True:
+            if self.tools["input"].welcome_message_played():
+                logger.info(f"Welcome message has been played")
+                self.first_message_passing_time = time.time()
+                if len(self.transcriber_message):
+                    logger.info(f"Sending the accumulated transcribed message - {self.transcriber_message}")
+                    await self.__send_first_message(self.transcriber_message)
+                    self.transcriber_message = ""
+                break
+
+            await asyncio.sleep(0.1)
+        self.handle_accumulated_message_task = None
+
+    # Currently this loop only closes in case of interruption
+    # but it shouldn't be the case.
+    async def __process_output_loop(self):
+        # When the pre-delay gate first closed, so the audio trace can report how
+        # long audio was held rather than just that it was.
+        _delay_since = None
+        try:
+            while True:
+                if self.tools["input"].welcome_message_played():
+                    should_delay, sleep_duration = self.interruption_manager.should_delay_output(
+                        self.tools["input"].welcome_message_played()
+                    )
+                    if should_delay:
+                        if _delay_since is None:
+                            _delay_since = time.monotonic()
+                        await asyncio.sleep(sleep_duration)
+                        continue
+                    if _delay_since is not None:
+                        atrace.delay(None, time.monotonic() - _delay_since)
+                        _delay_since = None
+                else:
+                    logger.info(f"Started transmitting at {time.time()}")
+
+                message = await self.buffered_output_queue.get()
+
+                if "end_of_conversation" in message["meta_info"]:
+                    await self.__process_end_of_conversation()
+
+                sequence_id = message["meta_info"].get("sequence_id")
+
+                # agent_hangup audio must always reach Plivo regardless of interruption state.
+                # If callee_speaking is stuck True (e.g. Deepgram false VAD with no SpeechFinal),
+                # the WAIT loop would block the goodbye forever and the call would never end.
+                is_hangup_message = message["meta_info"].get("message_category") == "agent_hangup"
+
+                # Centralized tri-state decision loop (handles race condition + grace period)
+                should_continue_outer_loop = False
+                _wait_since = None  # when this chunk first hit a closed gate
+                while True:
+                    status = (
+                        "SEND"
+                        if is_hangup_message
+                        else self.interruption_manager.get_audio_send_status(sequence_id, len(self.history))
+                    )
+
+                    if status == "SEND":
+                        if _wait_since is not None:
+                            atrace.gate(
+                                sequence_id,
+                                "held then sent",
+                                time.monotonic() - _wait_since,
+                                "user_speaking"
+                                if self.interruption_manager.is_user_speaking()
+                                else "grace_period",
+                            )
+                            _wait_since = None
+                        # Audio approved - send it
+                        if sequence_id is not None:
+                            self._sent_audio_sequences.add(sequence_id)
+                        self._commit_staged_assistant_history(sequence_id)
+                        self.tools["input"].update_is_audio_being_played(True)
+                        self.response_in_pipeline = False
+                        await self.tools["output"].handle(message)
+                        # Track when agent audio first starts flowing for this sequence.
+                        # Only fire on real audio bytes — BOS/EOS control packets are strings
+                        # and fire before _synthesize() sets tts_start_ms, causing inversion.
+                        if sequence_id is not None and sequence_id != -1 and isinstance(message.get("data"), bytes):
+                            self.interruption_manager.on_agent_speech_started(sequence_id)
+                        try:
+                            duration = calculate_audio_duration(
+                                len(message["data"]), self.sampling_rate, format=message["meta_info"]["format"]
+                            )
+                            if self.should_record:
+                                self.conversation_recording["output"].append(
+                                    {"data": message["data"], "start_time": time.time(), "duration": duration}
+                                )
+                        except Exception as e:
+                            duration = 0.256
+                            logger.info("Exception in __process_output_loop: {}".format(str(e)))
+                        break  # Exit inner loop, audio sent
+
+                    elif status == "BLOCK":
+                        # Audio blocked (user speaking or invalid sequence) - discard
+                        logger.info(f"Audio blocked: discarding message (sequence_id={sequence_id})")
+                        atrace.gate(
+                            sequence_id,
+                            "DROPPED",
+                            (time.monotonic() - _wait_since) if _wait_since else 0.0,
+                            "stale_sequence",
+                        )
+                        if sequence_id is not None and sequence_id not in self._blocked_sequences:
+                            self._blocked_sequences.add(sequence_id)
+                            self.blocked_audio_events.append(
+                                {
+                                    "sequence_id": sequence_id,
+                                    "ts_ms": round(time.time() * 1000 - self.conversation_start_init_ts, 2),
+                                    "is_audio_playing": self.tools["input"].is_audio_being_played_to_user(),
+                                    "response_in_pipeline": self.response_in_pipeline,
+                                }
+                            )
+                        self._drop_staged_assistant_history(sequence_id, "output_blocked")
+                        # Null byte (b'\x00') is the end-of-stream control signal, not audio.
+                        # Always send it through handle() so the is_final_chunk post-mark is
+                        # created and sent to Plivo. Without this, is_audio_being_played stays
+                        # True forever because no final mark echo ever arrives.
+                        if message["data"] == b"\x00":
+                            await self.tools["output"].handle(message)
+                        if message["meta_info"].get("end_of_llm_stream", False) or message["meta_info"].get(
+                            "end_of_synthesizer_stream", False
+                        ):
+                            self._turn_audio_flushed.set()
+                            # The entire LLM response was blocked — no audio will ever reach
+                            # the SEND path that normally resets this flag. Clear it here so
+                            # subsequent user speech is not permanently treated as an interruption.
+                            self.response_in_pipeline = False
+                        should_continue_outer_loop = True
+                        break  # Exit inner loop, skip to next message
+
+                    elif status == "WAIT":
+                        # Grace period active - hold and retry
+                        if _wait_since is None:
+                            _wait_since = time.monotonic()
+                        await asyncio.sleep(0.05)
+                        # Continue inner loop to re-check status
+
+                if should_continue_outer_loop:
+                    continue
+
+                # Signal that the turn's audio has been fully flushed to the output.
+                # This is reached only in the SEND path (BLOCK path breaks before here),
+                # so it is a reliable signal that a complete response was delivered.
+                if message["meta_info"].get("end_of_llm_stream", False) or message["meta_info"].get(
+                    "end_of_synthesizer_stream", False
+                ):
+                    self._turn_audio_flushed.set()
+                    if message["meta_info"].get("end_of_synthesizer_stream", False):
+                        _seq = message["meta_info"].get("sequence_id")
+                        if _seq is not None:
+                            self._agent_end_timestamps[_seq] = round(
+                                time.time() * 1000 - self.conversation_start_init_ts, 2
+                            )
+                        self.interruption_manager.on_successful_response_delivered(sequence_id)
+                        self.interruption_manager.on_agent_speech_ended()
+                        if (
+                            self.__is_graph_agent()
+                            and message["meta_info"].get("message_category", "") not in _NON_NODE_RESPONSE_CATEGORIES
+                        ):
+                            self.tools["llm_agent"].mark_first_response_delivered()
+                    # Reset asked_if_user_is_still_there flag after any message except is_user_online_message
+                    if message["meta_info"].get("message_category", "") != "is_user_online_message":
+                        self.asked_if_user_is_still_there = False
+
+                # # The below code is redundant in the case of telephony
+                # if "is_final_chunk_of_entire_response" in message['meta_info'] and message['meta_info']['is_final_chunk_of_entire_response']:
+                #     self.started_transmitting_audio = False
+                #     logger.info("##### End of synthesizer stream")
+                #
+                #     if message['meta_info'].get('message_category', '') == 'agent_hangup':
+                #         await self.__process_end_of_conversation()
+                #         break
+                #
+                #     #If we're sending the message to check if user is still here, don't set asked_if_user_is_still_there to True
+                #     if message['meta_info'].get('text', '') != self.check_user_online_message:
+                #         self.asked_if_user_is_still_there = False
+                #
+                #     self.turn_id += 1
+                #
+                # # The below code is redundant in the case of telephony
+                # if "is_first_chunk_of_entire_response" in message['meta_info'] and message['meta_info']['is_first_chunk_of_entire_response']:
+                #     logger.info(f"First chunk stuff")
+                #     self.started_transmitting_audio = True if "is_final_chunk_of_entire_response" not in message['meta_info'] else False
+                #     self.consider_next_transcript_after = time.time() + self.duration_to_prevent_accidental_interruption
+                #     self.__process_latency_data(message)
+                # else:
+                #     # Sleep until this particular audio frame is spoken only if the duration for the frame is atleast 500ms
+                #     if duration > 0:
+                #         logger.info(f"##### Sleeping for {duration} to maintain quueue on our side {self.sampling_rate}")
+                #         await asyncio.sleep(duration - 0.030) #30 milliseconds less
+                # if message['meta_info']['sequence_id'] != -1: #Making sure we only track the conversation's last transmitted timesatamp
+                #     self.last_transmitted_timestamp = time.time()
+
+                # try:
+                #     logger.info(f"Updating Last transmitted timestamp to {str(self.last_transmitted_timestamp)}")
+                # except Exception as e:
+                #     logger.error(f'Error in printing Last transmitted timestamp: {str(e)}')
+
+        except Exception as e:
+            traceback.print_exc()
+            logger.error(f"Error in processing message output: {str(e)}")
+
+    async def _inject_and_run_llm(self, injected_message: str):
+        self.conversation_history.append_user(injected_message)
+        meta_info = self.__get_updated_meta_info(
+            {
+                "io": self.tools["output"].get_provider(),
+                "request_id": str(uuid.uuid4()),
+                "cached": False,
+                "format": self.task_config["tools_config"]["output"].get("format", "pcm"),
+            }
+        )
+        self.response_in_pipeline = True
+        task = asyncio.create_task(self._run_llm_task(create_ws_data_packet(injected_message, meta_info)))
+        self.llm_task = task
+        try:
+            await task
+        except asyncio.CancelledError:
+            logger.info("Silence repeat generation cancelled by interruption")
+            return
+
+    def _should_stall_hangup(
+        self, audio_playing, has_pending_generation, time_since_last_spoken_ai_word, time_since_user_last_spoke
+    ):
+        """Hang up when the call has made no forward progress at all: no audio playing, nothing
+        in flight, and both sides silent past the floor. Runs above the audio/pipeline gate so it
+        still applies when a pipeline flag is stuck. Floor stays above hangup_after_silence so the
+        normal inactivity path takes precedence whenever it is reachable."""
+        if self.hang_conversation_after <= 0:
+            return False
+        stall_timeout = max(self.hang_conversation_after, STALL_HANGUP_FLOOR_S)
+        return (
+            not audio_playing
+            and not has_pending_generation
+            and time_since_last_spoken_ai_word > stall_timeout
+            and time_since_user_last_spoke > stall_timeout
+        )
+
+    def compute_last_ai_audio_timestamp(self):
+        """Most recent moment agent audio was still reaching the user.
+
+        last_transmitted_timestamp only advances on a turn's final-chunk mark ack, so it stays
+        frozen through a long turn and the watchdog scores a still-speaking agent as silent.
+        The playout estimate covers that turn, and clamping it to now means the measured silence
+        can only shrink, never grow, so this can delay a hangup but never cause an earlier one.
+        """
+        return max(
+            self.last_transmitted_timestamp, min(time.time(), self.mark_event_meta_data.get_audio_playing_until())
+        )
+
+    async def __check_for_completion(self):
+        logger.info(f"Starting task to check for completion")
+        while True:
+            await asyncio.sleep(2)
+
+            if self.is_web_based_call and time.time() - self.start_time >= int(
+                self.task_config["task_config"]["call_terminate"]
+            ):
+                logger.info("Hanging up for web call as max time of call has been reached")
+                await self.__process_end_of_conversation(web_call_timeout=True)
+                self.hangup_detail = HangupReason.WEB_CALL_MAX_DURATION_REACHED
+                break
+
+            if self.last_transmitted_timestamp == 0:
+                logger.info(f"Last transmitted timestamp is simply 0 and hence continuing")
+                continue
+
+            if self.hangup_triggered:
+                if self.conversation_ended:
+                    logger.info(f"Call hangup completed successfully")
+                    break
+
+                if self.hangup_triggered_at:
+                    time_since_hangup = time.time() - self.hangup_triggered_at
+                    if time_since_hangup > self.hangup_mark_event_timeout:
+                        logger.warning(
+                            f"Hangup mark event not received within {self.hangup_mark_event_timeout}s (waited {time_since_hangup:.1f}s), forcing conversation end"
+                        )
+                        # Set hangup_sent since mark event didn't arrive
+                        if "output" in self.tools:
+                            self.tools["output"].set_hangup_sent()
+                        await self.__process_end_of_conversation()
+                        break
+                    else:
+                        logger.info(
+                            f"Waiting for hangup mark event ({time_since_hangup:.1f}s / {self.hangup_mark_event_timeout}s)"
+                        )
+                continue
+
+            # An in-flight LLM task (including a tool-call API request + follow-up generation
+            # running inside it) means a response is still being produced even though
+            # response_in_pipeline has flipped False after the filler audio. Treat that
+            # window as busy so we don't synthesize "are you still there" over the
+            # upcoming follow-up response. hang_conversation_after intentionally remains
+            # ungated so a truly hung task still triggers the inactivity hangup.
+            has_pending_generation = (self.llm_task is not None and not self.llm_task.done()) or (
+                self.execute_function_call_task is not None and not self.execute_function_call_task.done()
+            )
+
+            time_since_last_spoken_ai_word = time.time() - self.compute_last_ai_audio_timestamp()
+            time_since_user_last_spoke = (
+                (time.time() - self.time_since_last_spoken_human_word)
+                if self.time_since_last_spoken_human_word > 0
+                else float("inf")
+            )
+
+            # Must run above the audio/pipeline gate below (see method docstring).
+            if self._should_stall_hangup(
+                audio_playing=self.tools["input"].is_audio_being_played_to_user(),
+                has_pending_generation=has_pending_generation,
+                time_since_last_spoken_ai_word=time_since_last_spoken_ai_word,
+                time_since_user_last_spoke=time_since_user_last_spoke,
+            ):
+                logger.warning(
+                    f"Stall backstop: no forward progress for {time_since_last_spoken_ai_word:.1f}s "
+                    f"(audio_playing=False, no pending generation, response_in_pipeline={self.response_in_pipeline}) "
+                    f"- forcing hangup"
+                )
+                self.hangup_detail = HangupReason.INACTIVITY_TIMEOUT
+                await self.process_call_hangup()
+                break
+
+            # Draining audio needs no term here: every branch below is gated on
+            # time_since_last_spoken_ai_word, which stays at 0 while the caller can still hear.
+            if self.tools["input"].is_audio_being_played_to_user() or self.response_in_pipeline:
+                continue
+
+            if (
+                self.repeat_after_silence_seconds
+                and time_since_last_spoken_ai_word > self.repeat_after_silence_seconds
+                and time_since_user_last_spoke > self.repeat_after_silence_seconds
+                and not self.response_in_pipeline
+                and not has_pending_generation
+            ):
+                await self._inject_and_run_llm(
+                    f"[silence] User was silent for {self.repeat_after_silence_seconds} seconds"
+                )
+                continue
+
+            if (
+                self.hang_conversation_after > 0
+                and time_since_last_spoken_ai_word > self.hang_conversation_after
+                and time_since_user_last_spoke > self.hang_conversation_after
+            ):
+                logger.info(
+                    f"{time_since_last_spoken_ai_word} seconds since AI last spoke and {time_since_user_last_spoke} seconds since user last spoke, both exceed {self.hang_conversation_after}s timeout - hanging up"
+                )
+                self.hangup_detail = HangupReason.INACTIVITY_TIMEOUT
+                await self.process_call_hangup()
+                break
+
+            elif (
+                time_since_last_spoken_ai_word > self.trigger_user_online_message_after
+                and not self.asked_if_user_is_still_there
+                and time_since_user_last_spoke > self.trigger_user_online_message_after
+                and not has_pending_generation
+            ):
+                logger.info(
+                    f"Asking if the user is still there (agent silent for {time_since_last_spoken_ai_word:.2f}s, user silent for {time_since_user_last_spoke:.2f}s)"
+                )
+                self.asked_if_user_is_still_there = True
+
+                if self.check_if_user_online:
+                    user_online_message = select_message_by_language(
+                        self.check_user_online_message_config, self.language
+                    )
+
+                    self.tools["input"].reset_response_heard_by_user()
+
+                    if self.should_record:
+                        meta_info = {
+                            "io": "default",
+                            "request_id": str(uuid.uuid4()),
+                            "cached": False,
+                            "sequence_id": -1,
+                            "format": "wav",
+                            "message_category": "is_user_online_message",
+                            "end_of_llm_stream": True,
+                        }
+                        await self._synthesize(create_ws_data_packet(user_online_message, meta_info=meta_info))
+                    else:
+                        meta_info = {
+                            "io": self.tools["output"].get_provider(),
+                            "request_id": str(uuid.uuid4()),
+                            "cached": False,
+                            "sequence_id": -1,
+                            "format": "pcm",
+                            "message_category": "is_user_online_message",
+                            "end_of_llm_stream": True,
+                        }
+                        await self._synthesize(create_ws_data_packet(user_online_message, meta_info=meta_info))
+                    self.conversation_history.append_assistant(user_online_message, exclude_from_llm=True)
+
+                    # Explicitly reset the audio flag after synthesizing the prompt.
+                    # handle_interruption() below sends clearAudio to Plivo and wipes the
+                    # mark dictionary, so the final-chunk mark echo will never arrive and
+                    # is_audio_being_played would stay stuck True forever — blocking the
+                    # silence-hangup gate in this loop indefinitely.
+                    self.tools["input"].update_is_audio_being_played(False)
+
+                # Just in case we need to clear messages sent before
+                await self.tools["output"].handle_interruption()
+            else:
+                logger.info(
+                    f"Only {time_since_last_spoken_ai_word} seconds since last spoken time stamp and hence not cutting the phone call"
+                )
+
+    async def __check_for_backchanneling(self):
+        while True:
+            user_speaking_duration = self.interruption_manager.get_user_speaking_duration()
+            if (
+                self.interruption_manager.is_user_speaking()
+                and user_speaking_duration > self.backchanneling_start_delay
+            ):
+                filename = random.choice(self.filenames)
+                logger.info(f"Should send a random backchanneling words and sending them {filename}")
+                audio = await get_raw_audio_bytes(
+                    f"{self.backchanneling_audios}/{filename}", local=True, is_location=True
+                )
+                if not self.turn_based_conversation:
+                    # backchannel wavs are 8kHz; web/freeswitch play raw PCM at the synth rate
+                    # (self.sampling_rate, e.g. 24k) — sending them labeled 24k without upsampling
+                    # plays ~3x fast. mulaw telephony (twilio/plivo/exotel) stays 8k.
+                    # NB: the old `["output"] != "default"` compared a dict to a str (always True).
+                    output_provider = (self.task_config["tools_config"].get("output") or {}).get("provider")
+                    is_raw_pcm_output = self.is_web_based_call or output_provider == TelephonyProvider.FREESWITCH.value
+                    target_rate = self.sampling_rate if is_raw_pcm_output else 8000
+                    audio = resample(audio, target_sample_rate=target_rate, format="wav")
+                    audio = wav_bytes_to_pcm(audio)
+                await self.tools["output"].handle(create_ws_data_packet(audio, self.__get_updated_meta_info()))
+            else:
+                logger.info(
+                    f"Callee isn't speaking and hence not sending or {user_speaking_duration} is not greater than {self.backchanneling_start_delay}"
+                )
+            await asyncio.sleep(self.backchanneling_message_gap)
+
+    async def __first_message(self, timeout=10.0):
+        logger.info(f"Executing the first message task")
+        try:
+            if self.is_web_based_call:
+                logger.info("Sending agent welcome message for web based call")
+                text = self.kwargs.get("agent_welcome_message", None)
+                meta_info = {
+                    "io": "default",
+                    "message_category": "agent_welcome_message",
+                    "stream_sid": self.stream_sid,
+                    "request_id": str(uuid.uuid4()),
+                    "cached": False,
+                    "sequence_id": -1,
+                    "format": self.task_config["tools_config"]["output"]["format"],
+                    "text": text,
+                    "end_of_llm_stream": True,
+                }
+                self.stream_sid_ts = time.time() * 1000
+                if text and text.strip():
+                    self.conversation_history.append_welcome_message(text)
+                await self._synthesize(create_ws_data_packet(text, meta_info=meta_info))
+                return
+
+            start_time = asyncio.get_running_loop().time()
+            while True:
+                elapsed_time = asyncio.get_running_loop().time() - start_time
+                if elapsed_time > timeout:
+                    await self.__process_end_of_conversation()
+                    logger.warning("Timeout reached while waiting for stream_sid")
+                    break
+
+                if not self.stream_sid and not self.default_io:
+                    stream_sid = self.tools["input"].get_stream_sid()
+                    if stream_sid is not None:
+                        self.stream_sid_ts = time.time() * 1000
+                        logger.info(f"Got stream sid and hence sending the first message {stream_sid}")
+                        self.stream_sid = stream_sid
+                        text = self.kwargs.get("agent_welcome_message", None)
+                        meta_info = {
+                            "io": self.tools["output"].get_provider(),
+                            "message_category": "agent_welcome_message",
+                            "stream_sid": stream_sid,
+                            "request_id": str(uuid.uuid4()),
+                            "cached": True,
+                            "sequence_id": -1,
+                            "format": self.task_config["tools_config"]["output"]["format"],
+                            "text": text,
+                            "end_of_llm_stream": True,
+                        }
+                        if text and text.strip():
+                            self.conversation_history.append_welcome_message(text)
+                        if self.turn_based_conversation:
+                            meta_info["type"] = "text"
+                            bos_packet = create_ws_data_packet("<beginning_of_stream>", meta_info)
+                            await self.tools["output"].handle(bos_packet)
+                            await self.tools["output"].handle(create_ws_data_packet(text, meta_info))
+                            eos_packet = create_ws_data_packet("<end_of_stream>", meta_info)
+                            await self.tools["output"].handle(eos_packet)
+                        else:
+                            await self._synthesize(create_ws_data_packet(text, meta_info=meta_info))
+                        break
+                    else:
+                        logger.info(f"Stream id is still None, so not passing it")
+                        await asyncio.sleep(0.01)  # Sleep for half a second to see if stream id goes past None
+                elif self.default_io:
+                    logger.info(f"Shouldn't record")
+                    # meta_info={'io': 'default', 'is_first_message': True, "request_id": str(uuid.uuid4()), "cached": True, "sequence_id": -1, 'format': 'wav'}
+                    # await self._synthesize(create_ws_data_packet(self.kwargs['agent_welcome_message'], meta_info= meta_info))
+                    break
+
+        except Exception as e:
+            logger.error(f"Exception in __first_message {str(e)}")
+
+    async def handle_init_event(self, init_meta_data):
+        """
+        This function is used to handle the init event which we get from the client side in the case of web calling.
+
+        Args:
+            init_meta_data: This consists of the metadata which has been sent via the client. It would consist of the
+            context data which needs to be injected in the prompt.
+        """
+        try:
+            logger.info(f"handle_init_event has been triggered with metadata = {init_meta_data}")
+            self.context_data["recipient_data"].update(init_meta_data["context_data"])
+            logger.info(f"Context data updated - {self.context_data}")
+
+            self.prompts["system_prompt"] = update_prompt_with_context(self.prompts["system_prompt"], self.context_data)
+
+            if self.system_prompt["content"]:
+                system_prompt = self.system_prompt["content"]
+                system_prompt = update_prompt_with_context(system_prompt, self.context_data)
+                self.system_prompt["content"] = system_prompt
+                self.conversation_history.update_system_prompt(system_prompt)
+
+            if self.call_hangup_message_config and self.context_data:
+                if isinstance(self.call_hangup_message_config, dict):
+                    self.call_hangup_message_config = {
+                        lang: update_prompt_with_context(msg, self.context_data)
+                        for lang, msg in self.call_hangup_message_config.items()
+                    }
+                else:
+                    self.call_hangup_message_config = update_prompt_with_context(
+                        self.call_hangup_message_config, self.context_data
+                    )
+
+            agent_welcome_message = self.kwargs.get("agent_welcome_message", "")
+
+            agent_welcome_message = update_prompt_with_context(agent_welcome_message, self.context_data)
+            logger.info(f"Updated agent welcome message after context data replacement - {agent_welcome_message}")
+            self.kwargs["agent_welcome_message"] = agent_welcome_message
+            if len(self.conversation_history) == 2 and agent_welcome_message:
+                self.conversation_history.update_welcome_message(agent_welcome_message)
+
+            await self.tools["output"].send_init_acknowledgement()
+            self.first_message_task = asyncio.create_task(self.__first_message())
+        except Exception as e:
+            logger.error(f"Error occurred in handling init event - {e}")
+
+    async def run(self):
+        self._component_error = None  # Reset for each run
+        self._error_logged = False
+        try:
+            if self._is_conversation_task():
+                logger.info("started running")
+                # Create transcriber and synthesizer tasks
+                tasks = []
+                # tasks = [asyncio.create_task(self.tools['input'].handle())]
+
+                # In the case of web call we would play the first message once we receive the init event
+                if self.turn_based_conversation:
+                    self.first_message_task = asyncio.create_task(self.__first_message())
+
+                if not self.turn_based_conversation:
+                    self.first_message_passing_time = None
+                    self.handle_accumulated_message_task = asyncio.create_task(self.__handle_accumulated_message())
+                    if self.kwargs.get("transport") is not None:
+                        self.typed_input_task = asyncio.create_task(self.inject_typed_messages())
+                if "transcriber" in self.tools:
+                    tasks.append(asyncio.create_task(self._listen_transcriber()))
+                    self.transcriber_task = asyncio.create_task(self.tools["transcriber"].run())
+
+                if self.turn_based_conversation and self._is_conversation_task():
+                    logger.info(
+                        "Since it's connected through dashboard, I'll run listen_llm_tas too in case user wants to simply text"
+                    )
+                    self.llm_queue_task = asyncio.create_task(self._listen_llm_input_queue())
+
+                if "synthesizer" in self.tools and self._is_conversation_task() and not self.turn_based_conversation:
+                    try:
+                        self.synthesizer_task = asyncio.create_task(self.__listen_synthesizer())
+                    except asyncio.CancelledError as e:
+                        logger.error(f"Synth task got cancelled {e}")
+                        traceback.print_exc()
+
+                self.output_task = asyncio.create_task(self.__process_output_loop())
+                if not self.turn_based_conversation or self.enforce_streaming:
+                    self.hangup_task = asyncio.create_task(self.__check_for_completion())
+
+                    if self.should_backchannel:
+                        self.backchanneling_task = asyncio.create_task(self.__check_for_backchanneling())
+
+                    if self.__is_graph_agent():
+                        self.event_listener_task = asyncio.create_task(self._listen_events())
+
+                try:
+                    await asyncio.gather(*tasks)
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    if not isinstance(e, VoxComponentError):
+                        logger.error(f"Error: {e}")
+                    if self.run_id and not self._error_logged:
+                        if isinstance(e, VoxComponentError):
+                            error_msg = format_error_message(e.component, e.provider or e.model or "-", str(e))
+                            model = e.model or "-"
+                        else:
+                            error_msg = format_error_message("unknown", "-", str(e))
+                            model = "-"
+                        convert_to_request_log(
+                            error_msg,
+                            {"request_id": self.task_id, "sequence_id": None},
+                            model=model,
+                            component=LogComponent.ERROR,
+                            direction=LogDirection.ERROR,
+                            is_cached=False,
+                            run_id=self.run_id,
+                        )
+                    self._error_logged = True
+
+                _stored_err = self._component_error
+                if _stored_err is not None:
+                    self._component_error = None
+                    err_cls = _stored_err["cls"]
+                    if issubclass(err_cls, VoxComponentError):
+                        raise err_cls(
+                            _stored_err["message"], provider=_stored_err["provider"], model=_stored_err["model"]
+                        )
+                    else:
+                        raise Exception(_stored_err["message"])
+                for attr, cls, provider in [
+                    ("synthesizer_task", SynthesizerError, getattr(self, "synthesizer_provider", None)),
+                    (
+                        "transcriber_task",
+                        TranscriberError,
+                        self.task_config.get("tools_config", {}).get("transcriber", {}).get("provider"),
+                    ),
+                ]:
+                    task = getattr(self, attr, None)
+                    if task and task.done() and not task.cancelled():
+                        exc = task.exception()
+                        if exc is not None:
+                            raise cls(str(exc), provider=provider)
+
+                # _listen_transcriber can exit (transcriber idle-closes) while a hangup
+                # goodbye is still playing in llm_task; let it drain before trimming.
+                if self.hangup_triggered and not self.conversation_ended:
+                    await self.wait_for_current_message()
+
+                has_pending_marks = len(self.mark_event_meta_data.mark_event_meta_data) > 0
+                has_response_heard = bool(self.tools["input"].response_heard_by_user)
+                if has_pending_marks or has_response_heard:
+                    await self.sync_history(self.mark_event_meta_data.mark_event_meta_data.items(), time.time())
+                self.tools["input"].reset_response_heard_by_user()
+                logger.info("Conversation completed")
+                self.conversation_ended = True
+            else:
+                # Run agent followup tasks
+                try:
+                    if self.task_config["task_type"] == "webhook":
+                        await self._process_followup_task()
+                    else:
+                        await self._run_llm_task(self.input_parameters)
+                except VoxComponentError:
+                    raise
+                except Exception as e:
+                    raise
+
+        except asyncio.CancelledError as e:
+            traceback.print_exc()
+            logger.info(f"Websocket got cancelled {self.task_id}")
+
+        except Exception as e:
+            # Cancel all tasks on error
+            error_message = str(e)
+            if not isinstance(e, VoxComponentError):
+                logger.error(f"Exception in task manager run: {error_message}")
+
+            # Log call-breaking exception to CSV trace with component attribution (skip if already logged)
+            if self.run_id and not self._error_logged:
+                meta_info = {"request_id": self.task_id, "sequence_id": None}
+                if isinstance(e, VoxComponentError):
+                    error_msg = format_error_message(e.component, e.provider or e.model or "-", error_message)
+                    model = e.model or "-"
+                else:
+                    error_msg = format_error_message("unknown", "-", error_message)
+                    model = "-"
+                convert_to_request_log(
+                    error_msg,
+                    meta_info,
+                    model=model,
+                    component=LogComponent.ERROR,
+                    direction=LogDirection.ERROR,
+                    is_cached=False,
+                    run_id=self.run_id,
+                )
+
+            logger.info(f"Exception occurred {e}")
+            raise
+
+        finally:
+            self._component_error = None
+
+            # Cancel llm_task first and await it so that any transfer_end appended
+            # in __execute_function_call's finally block is captured before
+            # progression_data snapshots transfer_call_events below.
+            await process_task_cancellation(self.llm_task, "llm_task")
+
+            # Construct output
+            tasks_to_cancel = []
+            tasks_to_cancel.append(process_task_cancellation(self.first_message_task_new, "first_message_task_new"))
+            tasks_to_cancel.append(process_task_cancellation(self.llm_task, "llm_task"))
+            tasks_to_cancel.append(process_task_cancellation(self.llm_queue_task, "llm_queue_task"))
+            tasks_to_cancel.append(process_task_cancellation(self.typed_input_task, "typed_input_task"))
+            tasks_to_cancel.append(
+                process_task_cancellation(self.execute_function_call_task, "execute_function_call_task")
+            )
+            tasks_to_cancel.append(process_task_cancellation(self._lid_idle_watcher_task, "lid_idle_watcher_task"))
+            # Sync cancel BEFORE clearing, so an in-flight render can't repopulate the
+            if self.handoff_prewarm_task is not None:
+                self.handoff_prewarm_task.cancel()
+            tasks_to_cancel.append(process_task_cancellation(self.handoff_prewarm_task, "handoff_prewarm_task"))
+            self.handoff_audio_cache.clear()
+            tasks_to_cancel.append(
+                process_task_cancellation(self._post_switch_fallback_task, "post_switch_fallback_task")
+            )
+            if "synthesizer" in self.tools and self.synthesizer_task is not None:
+                tasks_to_cancel.append(process_task_cancellation(self.synthesizer_task, "synthesizer_task"))
+                tasks_to_cancel.append(
+                    process_task_cancellation(self.synthesizer_monitor_task, "synthesizer_monitor_task")
+                )
+                for task in self.synthesizer_tasks:
+                    tasks_to_cancel.append(process_task_cancellation(task, "synthesizer_task_item"))
+                self.synthesizer_tasks = []
+
+            # Transcriber cleanup
+            if "transcriber" in self.tools:
+                tasks_to_cancel.append(self.tools["transcriber"].cleanup())
+                if hasattr(self, "transcriber_task") and self.transcriber_task is not None:
+                    tasks_to_cancel.append(process_task_cancellation(self.transcriber_task, "transcriber_task"))
+
+            if self._is_conversation_task() and "transcriber" in self.tools and "synthesizer" in self.tools:
+                self.transcriber_latencies.connection_latency_ms = self.tools["transcriber"].connection_time
+                self.synthesizer_latencies.connection_latency_ms = self.tools["synthesizer"].connection_time
+
+                self.transcriber_latencies.turn_latencies = self.tools["transcriber"].turn_latencies
+                self.synthesizer_latencies.turn_latencies = self.tools["synthesizer"].turn_latencies
+
+                # Annotate each transcriber turn with was_interrupted so callers
+                # can see which ASR turns had a user barge-in without cross-referencing
+                # the separate interruption_events list.
+                _call_start_ms = self.conversation_start_init_ts
+
+                _interrupted_ids = self.interruption_manager.interrupted_transcriber_turn_ids
+                for _turn in self.transcriber_latencies.turn_latencies:
+                    _tid = _turn.get("turn_id")
+                    _turn["was_interrupted"] = _tid in _interrupted_ids if _tid is not None else False
+                    if _turn.get("asr_start_epoch_ms") is not None:
+                        _turn["asr_start_ms"] = round(_turn.pop("asr_start_epoch_ms") - _call_start_ms, 2)
+                    if _turn.get("asr_finalized_epoch_ms") is not None:
+                        _turn["asr_finalized_ms"] = round(_turn.pop("asr_finalized_epoch_ms") - _call_start_ms, 2)
+                    if _turn.get("asr_turn_start_epoch_ms") is not None:
+                        _turn["asr_turn_start_ms"] = round(_turn.pop("asr_turn_start_epoch_ms") - _call_start_ms, 2)
+                    if _turn.get("user_speech_end_epoch_ms") is not None:
+                        _turn["user_speech_end_ms"] = round(_turn.pop("user_speech_end_epoch_ms") - _call_start_ms, 2)
+
+                # Collect language detection latency if available
+                if hasattr(self, "language_detector") and self.language_detector.latency_data:
+                    detection_entry = self.language_detector.latency_data
+                    detected_epoch_ms = detection_entry.pop("detected_at_epoch_ms", None)
+                    if detected_epoch_ms is not None:
+                        detection_entry["ts_ms"] = round(detected_epoch_ms - _call_start_ms, 2)
+                    self.llm_latencies.other_latencies.append(detection_entry)
+
+                welcome_message_sent_ts = self.tools["output"].get_welcome_message_sent_ts()
+                _user_bot_latencies = [
+                    {
+                        "sequence_id": e["sequence_id"],
+                        "user_start_ms": round(e["user_start_s"] * 1000 - _call_start_ms, 2)
+                        if e.get("user_start_s") and e["user_start_s"] > 0
+                        else None,
+                        "user_first_start_ms": round(e["user_first_start_s"] * 1000 - _call_start_ms, 2)
+                        if e.get("user_first_start_s") and e["user_first_start_s"] > 0
+                        else None,
+                        "user_end_ms": round(e["user_end_s"] * 1000 - _call_start_ms, 2)
+                        if e.get("user_end_s") is not None
+                        else None,
+                        "agent_start_ms": round(e["agent_start_s"] * 1000 - _call_start_ms, 2),
+                        "latency_ms": e["latency_ms"],
+                        # agent_end_ms: mark ACK from provider (actual playback end, most accurate).
+                        # None when the final mark was never ACKed (e.g. call dropped mid-audio).
+                        "agent_end_ms": (
+                            round(e["agent_end_s"] * 1000 - _call_start_ms, 2)
+                            if e.get("agent_end_s") is not None
+                            else None
+                        ),
+                    }
+                    for e in self.interruption_manager.user_bot_latencies
+                ]
+
+                # Cancel the voicemail check BEFORE latency_dict/progression_data are snapshotted
+                # below — tasks_to_cancel is only awaited after the snapshot, so a cancelled-check
+                # record appended during that gather would never be persisted.
+                await process_task_cancellation(self.voicemail_handler.check_task, "voicemail_check_task")
+
+                output = {
+                    "messages": self._prepare_precise_transcript_messages(self.history),
+                    "conversation_time": time.time() - self.start_time,
+                    "label_flow": self.label_flow,
+                    "function_tool_api_call_details": copy.deepcopy(self.function_tool_api_call_details),
+                    "lid_detection_events": list(getattr(self.tools.get("transcriber"), "lid_detection_events", [])),
+                    "asr_lid_events": self._collect_flux_lid_events(),
+                    "language_switch_events": list(self.language_switch_events),
+                    "call_sid": self.call_sid,
+                    "stream_sid": self.stream_sid,
+                    "transcriber_duration": self.transcriber_duration,
+                    "synthesizer_characters": self.tools["synthesizer"].get_synthesized_characters(),
+                    "ended_by_assistant": self.ended_by_assistant,
+                    "latency_dict": {
+                        "llm_latencies": self.llm_latencies.model_dump(),
+                        "transcriber_latencies": self.transcriber_latencies.model_dump(),
+                        "synthesizer_latencies": self.synthesizer_latencies.model_dump(),
+                        "rag_latencies": self.rag_latencies,
+                        "routing_latencies": self.routing_latencies,
+                        "welcome_message_sent_ts": None,
+                        "stream_sid_ts": None,
+                        "interruption_stats": self.interruption_manager.get_interruption_stats(
+                            self.conversation_start_init_ts
+                        ),
+                        "user_bot_latencies": _user_bot_latencies,
+                        "mark_tracking": self.mark_event_meta_data.get_mark_tracking_summary(),
+                        "synthesizer_chunk_marks": self.mark_event_meta_data.get_chunk_marks(),
+                    },
+                    "hangup_detail": self.hangup_detail,
+                    "has_transfer": self.has_transfer,
+                }
+
+                try:
+                    if welcome_message_sent_ts:
+                        output["latency_dict"]["welcome_message_sent_ts"] = (
+                            welcome_message_sent_ts - self.conversation_start_init_ts
+                        )
+                    if self.stream_sid_ts:
+                        output["latency_dict"]["stream_sid_ts"] = self.stream_sid_ts - self.conversation_start_init_ts
+                except Exception as e:
+                    logger.error(f"error in logging audio latency ts {str(e)}")
+
+                output["progression_data"] = {
+                    "call_start_epoch_ms": self.conversation_start_init_ts,
+                    # Ground-truth transcript so the dashboard renders directly, not from latency gaps.
+                    "messages": copy.deepcopy(output["messages"]),
+                    "llm_latencies": copy.deepcopy(output["latency_dict"]["llm_latencies"]),
+                    "transcriber_latencies": copy.deepcopy(output["latency_dict"]["transcriber_latencies"]),
+                    "synthesizer_latencies": copy.deepcopy(output["latency_dict"]["synthesizer_latencies"]),
+                    "rag_latencies": output["latency_dict"]["rag_latencies"],
+                    "routing_latencies": copy.deepcopy(output["latency_dict"]["routing_latencies"]),
+                    "welcome_message_sent_ts": output["latency_dict"]["welcome_message_sent_ts"],
+                    "welcome_message_duration_ms": self.welcome_message_duration_ms,
+                    "interruption_stats": output["latency_dict"]["interruption_stats"],
+                    "user_bot_latencies": copy.deepcopy(output["latency_dict"]["user_bot_latencies"]),
+                    "mark_tracking": output["latency_dict"]["mark_tracking"],
+                    "hangup_triggered_ms": round(self.hangup_triggered_at * 1000 - self.conversation_start_init_ts, 2)
+                    if self.hangup_triggered_at
+                    else None,
+                    "hangup_detail": self.hangup_detail.value if self.hangup_detail else None,
+                    "hangup_decision_ms": round(self.hangup_decision_at * 1000 - self.conversation_start_init_ts, 2)
+                    if self.hangup_decision_at
+                    else None,
+                    "voicemail_detected": self.voicemail_handler.detected,
+                    "voicemail_check_count": self.voicemail_handler.check_count,
+                    "dtmf_events": list(self.dtmf_events),
+                    "non_fatal_llm_error_events": list(self.non_fatal_llm_error_events),
+                    "language_switch_events": list(self.language_switch_events),
+                    "transfer_call_events": list(self.transfer_call_events),
+                    "lid_detection_events": list(getattr(self.tools.get("transcriber"), "lid_detection_events", [])),
+                    "asr_lid_events": self._collect_flux_lid_events(),
+                    "transcriber_error_events": list(self.transcriber_error_events),
+                    "transcriber_reconnect_count": getattr(self.tools.get("transcriber"), "reconnect_count", 0),
+                    "blocked_audio_events": list(self.blocked_audio_events),
+                    "welcome_message_played_ts": (
+                        round(
+                            self.tools["input"].welcome_message_played_ts - self.conversation_start_init_ts,
+                            2,
+                        )
+                        if getattr(self.tools.get("input"), "welcome_message_played_ts", None)
+                        else None
+                    ),
+                }
+
+                # In progression_data: promote asr_turn_id to turn_id on LLM entries so the
+                # progression service can group by turn_id directly without seq indirection.
+                # Also stamp turn_id on user_bot_latencies using the same asr_turn map.
+                _seq_to_asr_turn: dict = {}
+                for _lt in output["progression_data"]["llm_latencies"].get("turn_latencies", []):
+                    _seq = _lt.get("sequence_id")
+                    _asr_tid = _lt.get("asr_turn_id")
+                    if _seq is not None and _asr_tid is not None:
+                        _seq_to_asr_turn[_seq] = _asr_tid
+                        _lt["turn_id"] = _asr_tid  # overwrite _response_turn_id with asr_turn_id
+
+                for _ub in output["progression_data"]["user_bot_latencies"]:
+                    _seq = _ub.get("sequence_id")
+                    if _seq is not None and _seq in _seq_to_asr_turn:
+                        _ub["turn_id"] = _seq_to_asr_turn[_seq]
+
+                # Stamp a user-speech record for unanswered/interrupted turns too (agent_start_ms stays None).
+                _ub_turns = {
+                    _ub.get("turn_id")
+                    for _ub in output["progression_data"]["user_bot_latencies"]
+                    if _ub.get("turn_id") is not None
+                }
+                for _tt in output["progression_data"]["transcriber_latencies"].get("turn_latencies", []):
+                    _tid = _tt.get("turn_id")
+                    if not isinstance(_tid, int) or _tid in _ub_turns or not _tt.get("final_transcript"):
+                        continue
+                    _u_start = _tt.get("asr_turn_start_ms")
+                    if _u_start is None:
+                        _u_start = _tt.get("asr_start_ms")
+                    _u_end = _tt.get("user_speech_end_ms")
+                    if _u_end is None:
+                        _u_end = _tt.get("asr_finalized_ms")
+                    output["progression_data"]["user_bot_latencies"].append(
+                        {
+                            "turn_id": _tid,
+                            "sequence_id": None,
+                            "user_start_ms": _u_start,
+                            "user_first_start_ms": _u_start,
+                            "user_end_ms": _u_end,
+                            "agent_start_ms": None,
+                            "agent_end_ms": None,
+                            "latency_ms": None,
+                        }
+                    )
+
+                for _tts_t in output["progression_data"]["synthesizer_latencies"].get("turn_latencies", []):
+                    _seq = _tts_t.get("sequence_id")
+                    if _seq is not None and _seq in _seq_to_asr_turn:
+                        _tts_t["turn_id"] = _seq_to_asr_turn[_seq]
+
+                # Strip PR-added fields from latency_dict sub-dicts so latency_dict stays at master state.
+                # progression_data (deep-copied above) keeps the full enriched versions.
+                _llm_turns = (output["latency_dict"]["llm_latencies"] or {}).get("turn_latencies", [])
+                for _t in _llm_turns:
+                    for _f in (
+                        "turn_id",
+                        "llm_start_ms",
+                        "response_text",
+                        "asr_turn_id",
+                        "input_tokens",
+                        "output_tokens",
+                        "reasoning_tokens",
+                        "cached_tokens",
+                        "model",
+                        "connection_latency_ms",
+                    ):
+                        _t.pop(_f, None)
+
+                _asr_turns = (output["latency_dict"]["transcriber_latencies"] or {}).get("turn_latencies", [])
+                for _t in _asr_turns:
+                    for _f in (
+                        "asr_start_ms",
+                        "asr_finalized_ms",
+                        "asr_turn_start_ms",
+                        "user_speech_end_ms",
+                    ):
+                        _t.pop(_f, None)
+
+                _tts_turns = (output["latency_dict"]["synthesizer_latencies"] or {}).get("turn_latencies", [])
+                for _t in _tts_turns:
+                    _t.pop("tts_start_ms", None)
+
+                for _e in output["latency_dict"]["user_bot_latencies"]:
+                    for _f in ("user_first_start_ms", "agent_end_ms"):
+                        _e.pop(_f, None)
+
+                _routing_turns = (output["latency_dict"]["routing_latencies"] or {}).get("turn_latencies", [])
+                for _t in _routing_turns:
+                    _t.pop("routing_end_ms", None)
+
+                tasks_to_cancel.append(process_task_cancellation(self.output_task, "output_task"))
+                tasks_to_cancel.append(process_task_cancellation(self.hangup_task, "hangup_task"))
+                tasks_to_cancel.append(process_task_cancellation(self.backchanneling_task, "backchanneling_task"))
+                # tasks_to_cancel.append(process_task_cancellation(self.initial_silence_task, 'initial_silence_task'))
+                tasks_to_cancel.append(process_task_cancellation(self.first_message_task, "first_message_task"))
+                tasks_to_cancel.append(process_task_cancellation(self.dtmf_task, "dtmf_task"))
+                tasks_to_cancel.append(process_task_cancellation(self.event_listener_task, "event_listener_task"))
+                tasks_to_cancel.append(
+                    process_task_cancellation(self.handle_accumulated_message_task, "handle_accumulated_message_task")
+                )
+
+                output["recording_url"] = None
+                if self.should_record:
+                    output["recording_url"] = await save_audio_file_to_s3(
+                        self.conversation_recording, self.sampling_rate, self.assistant_id, self.run_id
+                    )
+            else:
+                output = self.input_parameters
+                if self.task_config["task_type"] == "extraction":
+                    output = {
+                        "extracted_data": self.extracted_data,
+                        "task_type": "extraction",
+                        "latency_dict": {"llm_latencies": self.llm_latencies.model_dump()},
+                    }
+                elif self.task_config["task_type"] == "summarization":
+                    logger.info(f"self.summarized_data {self.summarized_data}")
+                    output = {
+                        "summary": self.summarized_data,
+                        "task_type": "summarization",
+                        "latency_dict": {"llm_latencies": self.llm_latencies.model_dump()},
+                    }
+                elif self.task_config["task_type"] == "webhook":
+                    output = {"status": self.webhook_response, "task_type": "webhook"}
+
+            try:
+                await asyncio.gather(*tasks_to_cancel)
+            except Exception as e:
+                logger.error(f"Error during task cancellation: {e}")
+            finally:
+                llm_agents_to_close = set()
+                llm_agent = self.tools.get("llm_agent")
+                if llm_agent is not None:
+                    llm_agents_to_close.add(llm_agent)
+                for agent in getattr(self, "llm_agent_map", {}).values():
+                    if agent is not None:
+                        llm_agents_to_close.add(agent)
+                for agent in llm_agents_to_close:
+                    if hasattr(agent, "llm") and hasattr(agent.llm, "close"):
+                        try:
+                            await agent.llm.close()
+                        except Exception as e:
+                            logger.error(f"Error closing LLM: {e}")
+                    for attr in ("conversation_completion_llm", "voicemail_llm"):
+                        aux = getattr(agent, attr, None)
+                        if aux and hasattr(aux, "close"):
+                            try:
+                                await aux.close()
+                            except Exception as e:
+                                logger.error(f"Error closing {attr}: {e}")
+                lang_det = getattr(self, "language_detector", None)
+                if lang_det:
+                    aux_llm = getattr(lang_det, "_llm", None)
+                    if aux_llm and hasattr(aux_llm, "close"):
+                        try:
+                            await aux_llm.close()
+                        except Exception as e:
+                            logger.error(f"Error closing language detector LLM: {e}")
+                for obs in self.observable_variables.values():
+                    obs._observers.clear()
+                self.observable_variables.clear()
+                for tool in self.tools.values():
+                    if hasattr(tool, "task_manager_instance"):
+                        tool.task_manager_instance = None
+                self.tools.clear()
+                self.kwargs.pop("task_manager_instance", None)
+                self.conversation_recording = {"input": {"data": b""}, "output": [], "metadata": {}}
+                self.conversation_history = None
+                self.request_logs.clear()
+                self.function_tool_api_call_details.clear()
+
+            return output
+
+    async def handle_cancellation(self, message):
+        try:
+            # Cancel all tasks on cancellation
+            tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            logger.info(f"tasks {len(tasks)}")
+            for task in tasks:
+                await process_task_cancellation(task, task.get_name())
+                logger.info(f"Cancelling task {task.get_name()}")
+                task.cancel()
+            logger.info(message)
+        except Exception as e:
+            traceback.print_exc()
+            logger.info(e)

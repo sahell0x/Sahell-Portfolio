@@ -1,0 +1,105 @@
+# Whole portfolio — frontend (Next.js) + backend (voice agent) — in one command.
+#
+#   cp .env.example .env      # host ports live here; change them on a clash
+#   docker compose up -d --build
+#
+# Each app still reads its OWN settings from its own folder:
+#   frontend/.env          RESEND_API_KEY, contact addresses, ...
+#   backend/.env           SARVAM_API_KEY, OPENAI_API_KEY, limits, voice, ...
+#
+# This root .env only decides where the two apps appear on this machine.
+# Inside the containers the ports are fixed (3000 / 8000), so changing
+# FRONTEND_PORT or BACKEND_PORT never touches the apps themselves.
+#
+# frontend/docker-compose.yml and backend/docker-compose.yml still work for
+# deploying either app on its own.
+
+name: ${COMPOSE_PROJECT_NAME:-portfolio}
+
+services:
+  backend:
+    build:
+      context: ./backend/voice-agent
+      dockerfile: Dockerfile
+    image: portfolio-voice-agent:latest
+    env_file:
+      - ./backend/.env
+    environment:
+      # Fixed inside the container; the host side is BACKEND_PORT below.
+      HOST: 0.0.0.0
+      PORT: 8000
+      # The browser calls this API from the frontend's origin, which depends on
+      # FRONTEND_PORT — so the allow-list has to follow it. Set
+      # BACKEND_ALLOWED_ORIGINS in the root .env to override (e.g. production).
+      ALLOWED_ORIGINS: ${BACKEND_ALLOWED_ORIGINS:-http://localhost:${FRONTEND_PORT:-3000},http://127.0.0.1:${FRONTEND_PORT:-3000}}
+    ports:
+      - "${BIND_HOST:-127.0.0.1}:${BACKEND_PORT:-8000}:8000"
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    volumes:
+      - voice-agent-logs:/srv/logs
+      - voice-agent-data:/srv/agent_data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Baked into the browser bundle at build time, and the browser reaches
+        # the backend through the HOST port — so by default it follows
+        # BACKEND_PORT. Set VOICE_API_URL in the root .env for a public URL
+        # (e.g. https://voice.example.com). Changing it needs `--build`.
+        NEXT_PUBLIC_VOICE_API_URL: ${VOICE_API_URL:-http://localhost:${BACKEND_PORT:-8000}}
+    image: portfolio-frontend:latest
+    env_file:
+      - ./frontend/.env
+    environment:
+      NODE_ENV: production
+      NEXT_TELEMETRY_DISABLED: 1
+      # Fixed inside the container; the host side is FRONTEND_PORT below.
+      HOSTNAME: 0.0.0.0
+      PORT: 3000
+      # Keep the runtime value in step with what was baked in above.
+      NEXT_PUBLIC_VOICE_API_URL: ${VOICE_API_URL:-http://localhost:${BACKEND_PORT:-8000}}
+    ports:
+      - "${BIND_HOST:-127.0.0.1}:${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 20s
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  voice-agent-logs:
+  voice-agent-data:

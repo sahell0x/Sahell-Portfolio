@@ -1,0 +1,93 @@
+# Portfolio frontend (Next.js) — self-contained deployment for this directory.
+#
+#   cd frontend
+#   cp .env.example .env      # fill it in; PORT lives here
+#   docker compose up -d --build
+#   curl -I localhost:${PORT}
+#
+# Compose reads the .env sitting next to this file, so every ${VAR} below is
+# resolved from it. nginx then proxies to http://127.0.0.1:${PORT}.
+#
+# NOTE: NEXT_PUBLIC_VOICE_API_URL is compiled into the browser bundle, so it is
+# passed as a build arg as well as an env var. Changing it needs a rebuild
+# (`docker compose up -d --build`), not just a restart.
+
+name: ${COMPOSE_PROJECT_NAME:-portfolio-frontend}
+
+services:
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_VOICE_API_URL: ${NEXT_PUBLIC_VOICE_API_URL:?set NEXT_PUBLIC_VOICE_API_URL in frontend/.env}
+    image: ${IMAGE_NAME:-portfolio-frontend}:${IMAGE_TAG:-latest}
+    container_name: ${CONTAINER_NAME:-portfolio-frontend}
+
+    # Runtime secrets (RESEND_API_KEY, the contact addresses) — read on every
+    # request by /api/contact, so a restart is enough to pick up a change.
+    env_file:
+      - .env
+
+    environment:
+      NODE_ENV: production
+      # server.js binds to this; it is the same number compose publishes below,
+      # so PORT in .env is the single place a port is named.
+      PORT: ${PORT:-3000}
+      # Must be 0.0.0.0 *inside* the container — binding to 127.0.0.1 there
+      # would make the app unreachable from the host. The interface actually
+      # exposed to the network is controlled by BIND_HOST below.
+      HOSTNAME: 0.0.0.0
+      NEXT_TELEMETRY_DISABLED: 1
+
+    # 127.0.0.1 by default: the app is reachable only from this host, which is
+    # what you want when nginx terminates TLS on the same box. Set BIND_HOST to
+    # 0.0.0.0 in .env if the proxy lives on another machine.
+    ports:
+      - "${BIND_HOST:-127.0.0.1}:${PORT:-3000}:${PORT:-3000}"
+
+    restart: unless-stopped
+
+    # PID 1 that reaps children and forwards signals, so `docker compose stop`
+    # is a clean SIGTERM rather than a 10-second timeout.
+    init: true
+    stop_grace_period: 20s
+
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    # A rendered Next server is mostly idle; the cap is a guard against a leak
+    # taking the box down, not a sizing exercise.
+    deploy:
+      resources:
+        limits:
+          memory: ${MEMORY_LIMIT:-512M}
+
+    # Without this a long-running container will fill the disk with JSON logs.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    networks:
+      - portfolio
+
+networks:
+  portfolio:
+    name: ${NETWORK_NAME:-portfolio-frontend}
+    # If nginx itself runs in Docker, delete the two lines above and instead
+    # join the proxy's network so it can reach this service by container name:
+    #
+    #   networks:
+    #     portfolio:
+    #       name: nginx-proxy
+    #       external: true

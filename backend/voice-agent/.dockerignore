@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Supplied at runtime via env_file, never baked into the image.
+.env
+
+# Written by the agent at startup; must not be inherited from the host.
+agent_data/
+logs/
+
+tests/
+scripts/
+deploy/
+Dockerfile
+docker-compose.yml
+README.md

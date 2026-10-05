@@ -1,0 +1,31 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+# Workspace-wide ignores. Per-app rules live in frontend/.gitignore
+
+node_modules/
+.DS_Store
+*.tsbuildinfo
+.env*
+!.env.example
+.vercel
+
+# ---- Python (backend/voice-agent) ----
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# The agent writes the generated agent prompt here at startup.
+agent_data/
+
+# The agent creates this at runtime.
+logs/
+
+# Brainstorm companion mockups
+.superpowers/
+
+# Playwright MCP screenshots / logs
+.playwright-mcp/
+
+#local documents
+docs/

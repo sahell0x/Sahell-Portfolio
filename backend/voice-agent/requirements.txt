@@ -1,0 +1,32 @@
+# Trimmed dependency set for the portfolio voice agent.
+#
+# vox/ ships no dependency list of its own. Its provider registries resolve
+# lazily (see vox/providers.py), so only the Sarvam + OpenAI + default-web path
+# is ever imported and Azure Speech, Google Cloud Speech, Polly/boto, Twilio,
+# Plivo, litellm and groq are all unnecessary. The transport is a plain
+# WebSocket served by uvicorn, so it needs no client library of its own.
+#
+# Python 3.12 is required: vox uses the stdlib `audioop` module, which was
+# removed in 3.13.
+
+# --- web server ---
+fastapi>=0.109.1,<1.0
+uvicorn[standard]>=0.30,<1.0
+pydantic>=2.9.0,<3.0
+python-dotenv>=1.0.0
+
+# --- vox engine runtime ---
+aiohttp>=3.10,<4.0
+aiofiles>=23.2.1
+httpx[http2]>=0.25.0
+websockets>=13.0,<16.0
+openai>=1.60.0
+numpy>=1.26.0,<3.0
+scipy>=1.11.4
+pydub>=0.25.1
+pytz>=2024.1
+python-dateutil>=2.8.2
+
+# --- tests ---
+pytest>=8.0
+pytest-asyncio>=0.24

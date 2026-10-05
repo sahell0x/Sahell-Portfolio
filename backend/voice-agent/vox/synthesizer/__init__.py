@@ -1,0 +1,42 @@
+"""Speech synthesizers.
+
+Attributes resolve lazily (PEP 562) so importing this package does not drag in
+every provider's third-party dependency. Upstream imported all of them eagerly;
+the portfolio voice agent only uses a couple, and the unused ones pulled in
+~20 packages it never calls. Public names are unchanged.
+
+Original kept alongside as ``__init__.py.orig``.
+"""
+
+from importlib import import_module
+
+_LAZY = {
+    "BaseSynthesizer": "vox.synthesizer.base_synthesizer",
+    "StreamSynthesizer": "vox.synthesizer.stream_synthesizer",
+    "PollySynthesizer": "vox.synthesizer.polly_synthesizer",
+    "ElevenlabsSynthesizer": "vox.synthesizer.elevenlabs_synthesizer",
+    "OPENAISynthesizer": "vox.synthesizer.openai_synthesizer",
+    "DeepgramSynthesizer": "vox.synthesizer.deepgram_synthesizer",
+    "AzureSynthesizer": "vox.synthesizer.azure_synthesizer",
+    "CartesiaSynthesizer": "vox.synthesizer.cartesia_synthesizer",
+    "RimeSynthesizer": "vox.synthesizer.rime_synthesizer",
+    "SmallestSynthesizer": "vox.synthesizer.smallest_synthesizer",
+    "SarvamSynthesizer": "vox.synthesizer.sarvam_synthesizer",
+    "PixaSynthesizer": "vox.synthesizer.pixa_synthesizer",
+    "SynthesizerPool": "vox.synthesizer.synthesizer_pool",
+}
+
+__all__ = sorted(_LAZY)
+
+
+def __getattr__(name):
+    module_path = _LAZY.get(name)
+    if module_path is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(module_path), name)
+    globals()[name] = value  # cache; __getattr__ only fires on a miss
+    return value
+
+
+def __dir__():
+    return list(__all__)

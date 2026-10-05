@@ -1,0 +1,105 @@
+# Portfolio voice agent (FastAPI + uvicorn) — self-contained deployment.
+#
+#   cd backend
+#   cp .env.example .env      # two credentials; PORT lives here too
+#   docker compose up -d --build
+#   curl localhost:${PORT}/health
+#
+# The .env sits beside this file (NOT inside voice-agent/), and compose reads it
+# for both ${VAR} substitution below and the container's own environment — one
+# file to edit when deploying. The application source stays in voice-agent/,
+# which is the build context.
+#
+# nginx then proxies to http://127.0.0.1:${PORT}; see voice-agent/deploy/nginx.conf
+# for the site file, including the /ws/ upgrade block the conversation needs.
+
+name: ${COMPOSE_PROJECT_NAME:-portfolio-backend}
+
+services:
+  voice-agent:
+    build:
+      context: ./voice-agent
+      dockerfile: Dockerfile
+    image: ${IMAGE_NAME:-portfolio-voice-agent}:${IMAGE_TAG:-latest}
+    container_name: ${CONTAINER_NAME:-voice-agent}
+
+    # Every setting the app reads — credentials, limits, voice, models.
+    env_file:
+      - .env
+
+    environment:
+      # Fail at `up` with a readable message rather than at the first request
+      # with a 502. Values come from .env; these two have no sane default.
+      SARVAM_API_KEY: ${SARVAM_API_KEY:?set SARVAM_API_KEY in backend/.env}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY in backend/.env}
+      # uvicorn binds to this; it is the same number compose publishes below,
+      # so PORT in .env is the single place a port is named.
+      PORT: ${PORT:-8000}
+      # Must be 0.0.0.0 *inside* the container — binding to 127.0.0.1 there
+      # would make the API unreachable from the host. The interface actually
+      # exposed to the network is controlled by BIND_HOST below.
+      HOST: 0.0.0.0
+
+    # 127.0.0.1 by default. The rate limiter trusts X-Forwarded-For
+    # (TRUST_PROXY_HEADER), which is only safe when the sole way in is nginx —
+    # so keep this on loopback unless the proxy is on another host, and
+    # firewall the port if it ever isn't.
+    ports:
+      - "${BIND_HOST:-127.0.0.1}:${PORT:-8000}:${PORT:-8000}"
+
+    restart: unless-stopped
+
+    # PID 1 that reaps children and forwards signals, so a stop is a clean
+    # SIGTERM to uvicorn rather than a 10-second kill.
+    init: true
+    # Long enough for an in-flight conversation's socket to close politely.
+    stop_grace_period: 30s
+
+    volumes:
+      # Per-session CSV transcripts. On a named volume they survive a rebuild
+      # and don't inflate the container's writable layer.
+      - voice-agent-logs:/srv/logs
+      # The generated agent prompt, rewritten at every startup.
+      - voice-agent-data:/srv/agent_data
+
+    healthcheck:
+      # Reads PORT from the container's own environment, so it follows .env.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8000')+'/health', timeout=4).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    deploy:
+      resources:
+        limits:
+          memory: ${MEMORY_LIMIT:-1200M}
+
+    # Without this a long-running container will fill the disk with JSON logs.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    networks:
+      - portfolio
+
+volumes:
+  voice-agent-logs:
+  voice-agent-data:
+
+networks:
+  portfolio:
+    name: ${NETWORK_NAME:-portfolio-backend}
+    # If nginx itself runs in Docker, delete the two lines above and instead
+    # join the proxy's network so it can reach this service by container name:
+    #
+    #   networks:
+    #     portfolio:
+    #       name: nginx-proxy
+    #       external: true

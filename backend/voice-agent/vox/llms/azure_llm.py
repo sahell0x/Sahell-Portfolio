@@ -1,0 +1,386 @@
+import os
+import json
+import re
+from urllib.parse import urlparse
+from vox.llms.http_client_pool import get_shared_http_client
+from dotenv import load_dotenv
+from openai import (
+    AsyncAzureOpenAI,
+    AsyncOpenAI,
+    AuthenticationError,
+    PermissionDeniedError,
+    NotFoundError,
+    RateLimitError,
+    APIError,
+    APIConnectionError,
+    BadRequestError,
+)
+
+from vox.constants import DEFAULT_LANGUAGE_CODE, GPT5_MODEL_PREFIX, canonical_model, default_reasoning_effort
+from vox.enums import Verbosity
+from vox.helpers.utils import convert_to_request_log, compute_function_pre_call_message, now_ms
+from .openai_base import OpenAICompatibleLLM
+from .tool_call_accumulator import ToolCallAccumulator
+from .types import LLMStreamChunk, LatencyData
+from vox.helpers.logger_config import configure_logger
+
+logger = configure_logger(__name__)
+load_dotenv()
+
+
+class AzureLLM(OpenAICompatibleLLM):
+    def __init__(
+        self,
+        max_tokens=100,
+        buffer_size=40,
+        model="gpt-4.1-mini",
+        temperature=0.1,
+        language=DEFAULT_LANGUAGE_CODE,
+        **kwargs,
+    ):
+        super().__init__(max_tokens, buffer_size)
+
+        if model.startswith("azure/"):
+            self.model = model.replace("azure/", "", 1)
+        else:
+            self.model = model
+        # self.model is the Azure deployment name, which need not resemble the model it serves.
+        self._request_log_model = model
+        self._model_family = canonical_model(self.model)
+
+        self.custom_tools = kwargs.get("api_tools", None)
+        self.language = language
+        logger.info(f"Initializing Azure LLM with model: {self.model} and max tokens {max_tokens}")
+        logger.info(f"API Tools {self.custom_tools}")
+        if self.custom_tools is not None:
+            self.trigger_function_call = True
+            self.api_params = self.custom_tools["tools_params"]
+            logger.info(f"Function dict {self.api_params}")
+            self.tools = self.custom_tools["tools"]
+        else:
+            self.trigger_function_call = False
+
+        self.started_streaming = False
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        max_tokens_key = "max_tokens"
+        self.model_args = {}
+        if self.model_family.startswith(GPT5_MODEL_PREFIX):
+            max_tokens_key = "max_completion_tokens"
+            self.model_args["reasoning_effort"] = kwargs.get("reasoning_effort", None) or default_reasoning_effort(
+                self.model_family
+            )
+            self.model_args["verbosity"] = kwargs.get("verbosity", None) or Verbosity.LOW.value
+            self.reasoning_summary = kwargs.get("reasoning_summary")
+
+        self.model_args.update({max_tokens_key: self.max_tokens, "temperature": self.temperature, "model": self.model})
+        self.model_args["service_tier"] = kwargs.get("service_tier", "default")
+
+        azure_endpoint = kwargs.get("base_url", os.getenv("AZURE_OPENAI_ENDPOINT"))
+        api_key = kwargs.get("llm_key", os.getenv("AZURE_OPENAI_API_KEY"))
+        api_version = kwargs.get("api_version", os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview"))
+
+        http_client = get_shared_http_client(base_url=azure_endpoint, http2=False)
+
+        self.async_client = AsyncAzureOpenAI(
+            azure_endpoint=azure_endpoint, api_key=api_key, api_version=api_version, http_client=http_client
+        )
+
+        self.run_id = kwargs.get("run_id", None)
+        self.llm_host = urlparse(azure_endpoint).netloc if azure_endpoint else None
+
+        # Responses API: uses v1 endpoint with regular AsyncOpenAI client
+        self._init_responses_api(
+            kwargs.get("use_responses_api", False), compact_threshold=kwargs.get("compact_threshold")
+        )
+        if self.use_responses_api:
+            v1_base_url = f"{azure_endpoint.rstrip('/')}/openai/v1/"
+            self._responses_api_client = AsyncOpenAI(
+                api_key=api_key,
+                base_url=v1_base_url,
+                http_client=http_client,
+            )
+
+    @property
+    def _responses_client(self):
+        return getattr(self, "_responses_api_client", self.async_client)
+
+    async def generate_stream(
+        self, messages, synthesize=True, request_json=False, meta_info=None, tool_choice=None, tools=None
+    ):
+        if self.use_responses_api:
+            async for chunk in self._generate_stream_responses(
+                messages, synthesize, request_json, meta_info, tool_choice, tools
+            ):
+                yield chunk
+        else:
+            async for chunk in self._generate_stream_chat(
+                messages, synthesize, request_json, meta_info, tool_choice, tools
+            ):
+                yield chunk
+
+    async def _generate_stream_chat(
+        self, messages, synthesize=True, request_json=False, meta_info=None, tool_choice=None, tools=None
+    ):
+        if not messages or len(messages) == 0:
+            raise Exception("No messages provided")
+
+        response_format = self.get_response_format(request_json)
+        model_args = {
+            **self.model_args,
+            "response_format": response_format,
+            "messages": messages,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+
+        if not self.model_family.startswith(GPT5_MODEL_PREFIX):
+            model_args["stop"] = ["User:"]
+
+        if self.trigger_function_call:
+            _tools = self._parse_tools(tools)
+            if _tools:  # omit tools when none are visible this turn (an empty array is a 400)
+                model_args["tools"] = _tools
+                model_args["tool_choice"] = tool_choice or "auto"
+                model_args["parallel_tool_calls"] = False
+
+        answer, buffer = "", ""
+        tools = model_args.get("tools", [])
+        accumulator = None
+        if self.trigger_function_call:
+            accumulator = ToolCallAccumulator(
+                self.api_params, tools, self.language, self.request_log_model, self.run_id
+            )
+
+        text_tool_buffer = None
+        captured_tool_text = None
+
+        start_time = now_ms()
+        first_token_time = None
+        latency_data = None
+        stream_usage = None
+
+        try:
+            completion_stream = await self.async_client.chat.completions.create(**model_args)
+        except BadRequestError as e:
+            logger.error(f"Azure OpenAI bad request: {e}")
+            raise
+        except AuthenticationError as e:
+            logger.error(f"Azure OpenAI authentication failed: {e}")
+            raise
+        except PermissionDeniedError as e:
+            logger.error(f"Azure OpenAI permission denied: {e}")
+            raise
+        except NotFoundError as e:
+            logger.error(f"Azure OpenAI resource not found: {e}")
+            raise
+        except RateLimitError as e:
+            logger.error(f"Azure OpenAI rate limit exceeded: {e}")
+            raise
+        except APIConnectionError as e:
+            logger.error(f"Azure OpenAI connection error: {e} | cause: {e.__cause__!r}")
+            raise
+        except APIError as e:
+            logger.error(f"Azure OpenAI API error: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Azure OpenAI unexpected error: {e}")
+            raise
+
+        async for chunk in completion_stream:
+            # Final usage-only chunk (choices=[]) from stream_options
+            if not chunk.choices or len(chunk.choices) == 0:
+                if hasattr(chunk, "usage") and chunk.usage:
+                    stream_usage = chunk.usage
+                continue
+
+            choice = chunk.choices[0]
+            now = now_ms()
+            if not first_token_time:
+                first_token_time = now
+                self.started_streaming = True
+                latency_data = LatencyData(
+                    sequence_id=meta_info.get("sequence_id"),
+                    first_token_latency_ms=first_token_time - start_time,
+                )
+
+            delta = choice.delta
+
+            if hasattr(delta, "tool_calls") and delta.tool_calls and accumulator:
+                if buffer:
+                    yield LLMStreamChunk(data=buffer, end_of_stream=True, latency=latency_data)
+                    buffer = ""
+
+                accumulator.process_delta(delta.tool_calls)
+
+                pre_call = accumulator.get_pre_call_message(meta_info)
+                if pre_call:
+                    yield LLMStreamChunk(
+                        data=pre_call[0],
+                        end_of_stream=True,
+                        latency=latency_data,
+                        function_name=pre_call[1],
+                        function_message=pre_call[2],
+                    )
+
+            elif hasattr(delta, "content") and delta.content is not None:
+                if accumulator:
+                    accumulator.received_textual = True
+                content = delta.content
+
+                if text_tool_buffer is not None:
+                    text_tool_buffer += content
+                    end_pos = self._find_tool_call_end(text_tool_buffer)
+                    if end_pos != -1:
+                        if captured_tool_text is not None:
+                            logger.warning(
+                                f"Multiple text tool calls in one stream — dropping earlier: {captured_tool_text[:60]!r}"
+                            )
+                        captured_tool_text = text_tool_buffer[:end_pos]
+                        remainder = text_tool_buffer[end_pos:].lstrip("\n")
+                        text_tool_buffer = None
+                        answer += remainder
+                        buffer = remainder
+                elif (idx := self._find_text_tool_call_start(buffer + content, tools)) != -1:
+                    combined = buffer + content
+                    before = combined[:idx]
+                    after = combined[idx:]
+                    if before:
+                        answer += before
+                        if synthesize:
+                            yield LLMStreamChunk(data=before, end_of_stream=False, latency=latency_data)
+                    end_pos = self._find_tool_call_end(after)
+                    if end_pos != -1:
+                        if captured_tool_text is not None:
+                            logger.warning(
+                                f"Multiple text tool calls in one stream — dropping earlier: {captured_tool_text[:60]!r}"
+                            )
+                        captured_tool_text = after[:end_pos]
+                        remainder = after[end_pos:].lstrip("\n")
+                        answer += remainder
+                        buffer = remainder
+                    else:
+                        text_tool_buffer = after
+                        buffer = ""
+                else:
+                    answer += content
+                    buffer += content
+                    if synthesize and len(buffer) >= self.buffer_size:
+                        split = buffer.rsplit(" ", 1)
+                        yield LLMStreamChunk(data=split[0], end_of_stream=False, latency=latency_data)
+                        buffer = split[1] if len(split) > 1 else ""
+
+        if latency_data:
+            latency_data.total_stream_duration_ms = now_ms() - start_time
+
+        if text_tool_buffer is not None:
+            captured_tool_text = text_tool_buffer
+
+        if captured_tool_text and not (accumulator and accumulator.final_tool_calls):
+            logger.warning(f"Text tool call detected in content stream, attempting rescue: {captured_tool_text[:80]}")
+            rescue_chunk = self._try_rescue_text_tool_call(
+                captured_tool_text, model_args, meta_info, answer, latency_data
+            )
+            if rescue_chunk:
+                yield rescue_chunk
+            else:
+                # A functions.<name>(...) fragment is never speech; drop it rather than speak ids aloud.
+                logger.warning(f"Text tool call rescue failed, dropping fragment: {captured_tool_text[:80]!r}")
+
+        if accumulator and accumulator.final_tool_calls:
+            api_call_payload = accumulator.build_api_payload(model_args, meta_info, answer)
+            if api_call_payload:
+                fc_chunk = LLMStreamChunk(
+                    data=api_call_payload, end_of_stream=False, latency=latency_data, is_function_call=True
+                )
+                if stream_usage:
+                    fc_chunk.input_tokens = getattr(stream_usage, "prompt_tokens", None)
+                    fc_chunk.output_tokens = getattr(stream_usage, "completion_tokens", None)
+                    _d = getattr(stream_usage, "completion_tokens_details", None)
+                    if _d:
+                        fc_chunk.reasoning_tokens = getattr(_d, "reasoning_tokens", None)
+                    _pd = getattr(stream_usage, "prompt_tokens_details", None)
+                    if _pd:
+                        fc_chunk.cached_tokens = getattr(_pd, "cached_tokens", None)
+                yield fc_chunk
+
+        # Extract actual token counts from stream usage
+        usage_kwargs = {}
+        if stream_usage:
+            usage_kwargs["input_tokens"] = getattr(stream_usage, "prompt_tokens", None)
+            usage_kwargs["output_tokens"] = getattr(stream_usage, "completion_tokens", None)
+            details = getattr(stream_usage, "completion_tokens_details", None)
+            if details:
+                usage_kwargs["reasoning_tokens"] = getattr(details, "reasoning_tokens", None)
+            prompt_details = getattr(stream_usage, "prompt_tokens_details", None)
+            if prompt_details:
+                usage_kwargs["cached_tokens"] = getattr(prompt_details, "cached_tokens", None)
+
+        if synthesize:
+            yield LLMStreamChunk(data=buffer, end_of_stream=True, latency=latency_data, **usage_kwargs)
+        else:
+            yield LLMStreamChunk(data=answer, end_of_stream=True, latency=latency_data, **usage_kwargs)
+
+        self.started_streaming = False
+
+    async def generate(self, messages, request_json=False, ret_metadata=False):
+        if self.use_responses_api:
+            return await self._generate_responses(messages, request_json, ret_metadata)
+        return await self._generate_chat(messages, request_json, ret_metadata)
+
+    async def _generate_chat(self, messages, request_json=False, ret_metadata=False):
+        response_format = self.get_response_format(request_json)
+
+        try:
+            completion = await self.async_client.chat.completions.create(
+                model=self.model, temperature=0.0, messages=messages, stream=False, response_format=response_format
+            )
+
+            res = completion.choices[0].message.content
+            if ret_metadata:
+                metadata = {}
+                if completion.usage:
+                    metadata["input_tokens"] = completion.usage.prompt_tokens
+                    metadata["output_tokens"] = completion.usage.completion_tokens
+                    details = getattr(completion.usage, "completion_tokens_details", None)
+                    if details:
+                        metadata["reasoning_tokens"] = getattr(details, "reasoning_tokens", None)
+                    prompt_details = getattr(completion.usage, "prompt_tokens_details", None)
+                    if prompt_details:
+                        metadata["cached_tokens"] = getattr(prompt_details, "cached_tokens", None)
+                return res, metadata
+            else:
+                return res
+        except BadRequestError as e:
+            logger.error(f"Azure OpenAI bad request: {e}")
+            raise
+        except AuthenticationError as e:
+            logger.error(f"Azure OpenAI authentication failed: {e}")
+            raise
+        except PermissionDeniedError as e:
+            logger.error(f"Azure OpenAI permission denied: {e}")
+            raise
+        except NotFoundError as e:
+            logger.error(f"Azure OpenAI resource not found: {e}")
+            raise
+        except RateLimitError as e:
+            logger.error(f"Azure OpenAI rate limit exceeded: {e}")
+            raise
+        except APIConnectionError as e:
+            logger.error(f"Azure OpenAI connection error: {e} | cause: {e.__cause__!r}")
+            raise
+        except APIError as e:
+            logger.error(f"Azure OpenAI API error: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Azure OpenAI unexpected error: {e}")
+            raise
+
+    async def close(self):
+        pass  # httpx client is shared via pool, don't close it here
+
+    def get_response_format(self, is_json_format: bool):
+        if is_json_format and self.model in ("gpt-4-1106-preview", "gpt-3.5-turbo-1106", "gpt-4o-mini", "gpt-4.1-mini"):
+            return {"type": "json_object"}
+        else:
+            return {"type": "text"}

@@ -1,0 +1,34 @@
+{
+  "name": "portfolio",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "test:voice": "tsc --outDir .voice-checks --rootDir src/lib/voice --module commonjs --target es2020 --moduleResolution node --skipLibCheck src/lib/voice/__checks__/quotaMessage.check.ts && node .voice-checks/__checks__/quotaMessage.check.js"
+  },
+  "dependencies": {
+    "@vercel/analytics": "^2.0.1",
+    "geist": "^1.7.2",
+    "lucide-react": "^1.26.0",
+    "motion": "^12.42.2",
+    "next": "16.2.11",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "resend": "^6.18.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "babel-plugin-react-compiler": "1.0.0",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.11",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}

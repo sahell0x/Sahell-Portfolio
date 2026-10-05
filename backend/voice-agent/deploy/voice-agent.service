@@ -1,0 +1,37 @@
+# systemd unit for running the voice agent without Docker.
+#
+#   sudo cp deploy/voice-agent.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now voice-agent
+#   journalctl -u voice-agent -f
+#
+# Assumes the repo lives at /srv/portfolio and the venv at
+# /srv/portfolio/backend/voice-agent/.venv (see README "Bare metal").
+
+[Unit]
+Description=Portfolio voice agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/srv/portfolio/backend/voice-agent
+EnvironmentFile=/srv/portfolio/backend/voice-agent/.env
+ExecStart=/srv/portfolio/backend/voice-agent/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+
+Restart=always
+RestartSec=5
+
+# The process only needs to read the repo and write agent_data/.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/srv/portfolio/backend/voice-agent/agent_data
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
