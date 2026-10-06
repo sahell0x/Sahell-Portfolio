@@ -65,6 +65,13 @@ export const metadata: Metadata = {
     description,
   },
   robots: { index: true, follow: true },
+  icons: {
+    icon: [
+      { url: "/icon.svg", type: "image/svg+xml" },
+      { url: "/favicon.ico", sizes: "any" },
+    ],
+    apple: "/apple-icon.png",
+  },
 };
 
 export const viewport: Viewport = {
