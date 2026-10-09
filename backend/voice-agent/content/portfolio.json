@@ -303,35 +303,6 @@
         "github": "https://github.com/sahell0x/Assay-Finance",
         "demo": "https://assay.sahell.in"
       }
-    },
-    {
-      "slug": "feelochat",
-      "name": "FeeloChat",
-      "tagline": "Secure, real-time, emotion-aware chat",
-      "description": "An end-to-end encrypted chat app that shares real-time emotion. A lightweight ML model runs directly in the browser (face-api.js) to detect facial expressions, so raw video never leaves the device — privacy by design.",
-      "highlights": [
-        "In-browser facial-expression detection via face-api.js — zero server-side image processing.",
-        "Socket.io realtime with sub-100ms processing and zero-lag sync across concurrent users.",
-        "Complex UI state managed cleanly with Recoil."
-      ],
-      "stack": [
-        "React.js",
-        "TypeScript",
-        "Recoil",
-        "Express.js",
-        "face-api.js",
-        "Socket.io",
-        "MongoDB"
-      ],
-      "tags": [
-        "Realtime",
-        "ML in browser",
-        "E2E Encryption"
-      ],
-      "links": {
-        "github": "https://github.com/sahell0x",
-        "demo": "https://example.com"
-      }
     }
   ],
   "socials": [
