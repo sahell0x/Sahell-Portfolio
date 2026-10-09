@@ -267,6 +267,9 @@ const commands: Command[] = [
           </p>
         );
       }
+      if (q === "resume" || q === "resume.pdf") {
+        return resolveCommand("resume")?.run([], ctx);
+      }
       const project =
         projects.find((p) => p.slug === q || p.name.toLowerCase() === q) ??
         projects[Number(q) - 1];
@@ -352,12 +355,12 @@ const commands: Command[] = [
   {
     name: "resume",
     aliases: ["cv-download"],
-    description: "download my résumé (PDF)",
+    description: "open my résumé (PDF)",
     run: (_args, ctx) => {
-      ctx.download(profile.resumeUrl);
+      ctx.openUrl(profile.resumeUrl);
       return (
         <p className="text-dim">
-          downloading résumé… if it didn&apos;t start,{" "}
+          opening résumé… if it didn&apos;t open,{" "}
           <ExtLink href={profile.resumeUrl}>click here</ExtLink>.
         </p>
       );

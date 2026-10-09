@@ -127,10 +127,7 @@ export function CommandMenu() {
         icon: <ArrowDownToLine className={iconClass} />,
         keywords: "cv resume pdf",
         run: () => {
-          const a = document.createElement("a");
-          a.href = profile.resumeUrl;
-          a.download = "";
-          a.click();
+          window.open(profile.resumeUrl, "_blank", "noopener,noreferrer");
         },
       },
       {

@@ -74,7 +74,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     ),
     _tool(
         "download_resume",
-        "Start downloading Sahil's resume PDF for the visitor. Call this when "
+        "Open Sahil's resume for the visitor in a new tab. Call this when "
         "they ask for his resume or CV.",
         _NO_ARGS,
     ),

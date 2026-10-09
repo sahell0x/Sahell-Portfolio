@@ -46,7 +46,7 @@ export const profile: Profile = {
   ],
   email: "s.sahil9752@gmail.com",
   phone: "+91 9752588937",
-  resumeUrl: "/sahil_khan_resume.pdf",
+  resumeUrl: "https://resume.sahell.in",
   education: {
     school: "Jawaharlal Institute of Technology, Vidhya Vihar, Borawan",
     degree: "B.E. in Electronics & Communication Engineering",

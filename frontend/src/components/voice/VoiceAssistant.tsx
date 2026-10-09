@@ -660,7 +660,8 @@ export function VoiceAssistant() {
                         </a>
                         <a
                           href={profile.resumeUrl}
-                          download
+                          target="_blank"
+                          rel="noopener noreferrer"
                           className="flex flex-col items-center gap-1.5 rounded-xl border border-edge px-2 py-3 text-xs text-dim transition-colors hover:border-ink hover:text-ink"
                         >
                           <ArrowDownToLine className="h-4 w-4" />

@@ -119,7 +119,7 @@ def _contact_chunk(profile: dict[str, Any], socials: list[dict[str, Any]]) -> Ch
         _lines(
             f"Email: {profile.get('email', '')}",
             f"Phone: {profile.get('phone', '')}",
-            "Resume: downloadable from the site.",
+            f"Resume: {profile.get('resumeUrl', 'https://resume.sahell.in')}",
             *(f"{s.get('name', '')} ({s.get('handle', '')}): {s.get('url', '')}" for s in socials),
         ),
     )

@@ -174,7 +174,8 @@ export function Hero() {
         >
           <a
             href={profile.resumeUrl}
-            download
+            target="_blank"
+            rel="noopener noreferrer"
             className="group inline-flex items-center justify-center gap-2.5 rounded-full border border-ink bg-ink py-3 pr-4 pl-5 text-sm font-medium text-bg transition-transform active:scale-[0.97] max-sm:flex-[1.4] whitespace-nowrap sm:pr-5 sm:pl-6"
           >
             Download résumé

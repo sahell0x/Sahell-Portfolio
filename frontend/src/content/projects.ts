@@ -86,8 +86,8 @@ export const projects: Project[] = [
     ],
     tags: ["AI Agents", "DevTools", "Security"],
     links: {
-      github: "https://github.com/sahell0x",
-      demo: "https://example.com",
+      github: "https://github.com/sahell0x/HootPR",
+      demo: "https://hootpr.sahell.in",
     },
   },
   {
@@ -156,8 +156,8 @@ export const projects: Project[] = [
     ],
     tags: ["RAG", "Agents", "Finance"],
     links: {
-      github: "https://github.com/sahell0x",
-      demo: "https://example.com",
+      github: "https://github.com/sahell0x/Assay-Finance",
+      demo: "https://assay.sahell.in",
     },
   },
   {

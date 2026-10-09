@@ -30,7 +30,7 @@ const SECTION_IDS: Record<PageSection, string> = {
 const ACKS: Record<PageActionName, string> = {
   show_section: "Done — that section is now on screen.",
   open_terminal: "Done — the terminal is open.",
-  download_resume: "Done — the resume download has started.",
+  download_resume: "Done — the resume has opened.",
   open_contact_form: "Done — the contact form is open.",
 };
 
@@ -57,12 +57,7 @@ function scrollToSection(section: PageSection) {
 }
 
 function downloadResume() {
-  const link = document.createElement("a");
-  link.href = profile.resumeUrl;
-  link.download = "sahil_khan_resume.pdf";
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
+  window.open(profile.resumeUrl, "_blank", "noopener,noreferrer");
 }
 
 function openContactForm() {

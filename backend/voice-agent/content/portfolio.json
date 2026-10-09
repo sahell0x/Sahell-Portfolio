@@ -18,7 +18,7 @@
     ],
     "email": "s.sahil9752@gmail.com",
     "phone": "+91 9752588937",
-    "resumeUrl": "/sahil_khan_resume.pdf",
+    "resumeUrl": "https://resume.sahell.in",
     "education": {
       "school": "Jawaharlal Institute of Technology, Vidhya Vihar, Borawan",
       "degree": "B.E. in Electronics & Communication Engineering",
@@ -235,8 +235,8 @@
         "Security"
       ],
       "links": {
-        "github": "https://github.com/sahell0x",
-        "demo": "https://example.com"
+        "github": "https://github.com/sahell0x/HootPR",
+        "demo": "https://hootpr.sahell.in"
       }
     },
     {
@@ -300,8 +300,8 @@
         "Finance"
       ],
       "links": {
-        "github": "https://github.com/sahell0x",
-        "demo": "https://example.com"
+        "github": "https://github.com/sahell0x/Assay-Finance",
+        "demo": "https://assay.sahell.in"
       }
     },
     {
