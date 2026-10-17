@@ -37,6 +37,7 @@ check it cannot satisfy.
 
 from __future__ import annotations
 
+import ipaddress
 import threading
 import time
 from collections import deque
@@ -439,20 +440,68 @@ class RateLimiter:
             return LimitDecision(True)
 
 
+def normalize_ip(raw: str) -> str:
+    """Normalize IPv4 and IPv6 addresses.
+
+    For IPv6, masks the address to its /64 prefix (RFC 4941). Operating systems
+    use IPv6 privacy extensions to rotate the host portion across sessions,
+    tabs and private browsing windows on the same device/network. Masking to /64
+    groups all temporary addresses from the same subscriber line under one quota.
+    """
+    cleaned = raw.strip()
+    if not cleaned or cleaned.lower() == "unknown":
+        return "unknown"
+
+    # Strip bracketed IPv6 notation and optional port (e.g. "[2401:...]:5432" or "192.168.1.1:5432")
+    if cleaned.startswith("[") and "]" in cleaned:
+        cleaned = cleaned[1 : cleaned.index("]")]
+    elif ":" in cleaned and "." in cleaned and cleaned.count(":") == 1:
+        # IPv4 with port
+        cleaned = cleaned.split(":")[0]
+
+    try:
+        addr = ipaddress.ip_address(cleaned)
+        if addr.version == 6:
+            # Mask to /64 network prefix
+            net = ipaddress.ip_network(f"{addr}/64", strict=False)
+            return str(net.network_address)
+        return str(addr)
+    except ValueError:
+        return cleaned
+
+
 def client_ip(headers: dict[str, str], fallback: str, trust_proxy: bool) -> str:
-    """Resolve the caller's IP, honouring nginx's X-Forwarded-For when trusted.
+    """Resolve the caller's IP, honouring proxy headers when trusted.
+
+    Order of priority when trusted:
+    1. CF-Connecting-IP / True-Client-IP (Cloudflare verified edge header)
+    2. X-Real-IP (Nginx verified client IP)
+    3. X-Forwarded-For (Left-most entry is original client)
 
     Header lookup is case-insensitive because ASGI servers don't normalise for us.
+    All resolved IPs are normalized (e.g. IPv6 /64 prefix applied).
     """
     if trust_proxy:
         lowered = {k.lower(): v for k, v in headers.items()}
+        # Cloudflare attaches this header at edge; clients cannot forge it when proxied
+        cf_ip = lowered.get("cf-connecting-ip")
+        if cf_ip and cf_ip.strip():
+            return normalize_ip(cf_ip)
+
+        true_client_ip = lowered.get("true-client-ip")
+        if true_client_ip and true_client_ip.strip():
+            return normalize_ip(true_client_ip)
+
+        real_ip = lowered.get("x-real-ip")
+        if real_ip and real_ip.strip():
+            return normalize_ip(real_ip)
+
         forwarded = lowered.get("x-forwarded-for")
         if forwarded:
             # Left-most entry is the original client; the rest are proxies.
             first = forwarded.split(",")[0].strip()
             if first:
-                return first
-        real_ip = lowered.get("x-real-ip")
-        if real_ip and real_ip.strip():
-            return real_ip.strip()
-    return fallback
+                return normalize_ip(first)
+
+    return normalize_ip(fallback)
+

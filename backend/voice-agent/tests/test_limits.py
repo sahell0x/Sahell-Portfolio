@@ -177,6 +177,26 @@ class TestClientIp:
         headers = {"X-Forwarded-For": "   "}
         assert client_ip(headers, "10.0.0.1", trust_proxy=True) == "10.0.0.1"
 
+    def test_honours_cloudflare_connecting_ip(self):
+        headers = {
+            "CF-Connecting-IP": "203.0.113.88",
+            "X-Forwarded-For": "172.68.1.1",  # CF edge IP in proxy header
+        }
+        assert client_ip(headers, "10.0.0.1", trust_proxy=True) == "203.0.113.88"
+
+    def test_honours_true_client_ip(self):
+        headers = {"True-Client-IP": "198.51.100.99"}
+        assert client_ip(headers, "10.0.0.1", trust_proxy=True) == "198.51.100.99"
+
+    def test_normalizes_ipv6_to_64_prefix(self):
+        ip1 = "2401:4900:1c12:3456:a1b2:c3d4:e5f6:7890"
+        ip2 = "2401:4900:1c12:3456:9988:7766:5544:3322"
+        res1 = client_ip({"x-real-ip": ip1}, "10.0.0.1", trust_proxy=True)
+        res2 = client_ip({"x-real-ip": ip2}, "10.0.0.1", trust_proxy=True)
+        assert res1 == "2401:4900:1c12:3456::"
+        assert res1 == res2
+
+
 
 # ---------------------------------------------------------------------------
 # Per-device limits: the multi-tab and rapid-redial defences.
