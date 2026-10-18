@@ -235,6 +235,7 @@ END_CALL_TOOL_DEFINITION = {
 SARVAM_MODEL_SAMPLING_RATE_MAPPING = {
     "bulbul:v2": 22050,
     "bulbul:v3": 22050,  # NOTE: Documentation claims 24000, but WAV header shows 22050
+    "bulbul:v4-flash": 22050,
 }
 
 # bulbul TTS requires a concrete target_language_code (no "unknown"/auto).

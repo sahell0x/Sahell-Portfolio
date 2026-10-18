@@ -53,18 +53,17 @@ class Settings:
     # ---- models ----------------------------------------------------------
     llm_model: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "gpt-4o-mini"))
     stt_model: str = field(default_factory=lambda: os.getenv("STT_MODEL", "saaras:v3"))
-    tts_model: str = field(default_factory=lambda: os.getenv("TTS_MODEL", "bulbul:v3"))
+    tts_model: str = field(default_factory=lambda: os.getenv("TTS_MODEL", "bulbul:v4-flash"))
     # Voice must be a speaker the tts_model actually ships; anything else is
     # rejected on every synthesis and the agent goes silent. Retired names
     # that still turn up in old docs and configs: "meera" (bulbul:v1) and
     # "anushka", "manisha", "vidya", "arya" (bulbul:v2) — all four 400 on v3.
-    # Verified bulbul:v3 speakers: priya, ritu, neha, pooja, simran, kavya,
-    # ishita, shreya, roopa, tanya, shruti, suhani, kavitha, rupali (female);
-    # aditya, rahul, rohan, amit, dev (male).
+    # The v4-flash persona catalog includes names such as
+    # ishita_enhi_companion; the concrete speaker is configured by TTS_VOICE.
     # Kaira is a woman and the prompt commits her to feminine forms in every
     # language, so this must stay one of the female speakers or the voice and
     # the words contradict each other.
-    tts_voice: str = field(default_factory=lambda: os.getenv("TTS_VOICE", "ritu"))
+    tts_voice: str = field(default_factory=lambda: os.getenv("TTS_VOICE", "ishita_enhi_companion"))
     tts_language: str = field(default_factory=lambda: os.getenv("TTS_LANGUAGE", "en-IN"))
     # "unknown" puts Saaras v3 in auto-detect, which is what carries Hinglish.
     stt_language: str = field(default_factory=lambda: os.getenv("STT_LANGUAGE", "unknown"))

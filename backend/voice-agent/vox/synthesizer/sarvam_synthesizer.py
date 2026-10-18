@@ -74,7 +74,7 @@ class SarvamSynthesizer(StreamSynthesizer):
     def _process_audio_data(self, audio):
         fmt = get_synth_audio_format(audio)
 
-        if fmt == "wav" and self.model == "bulbul:v3":
+        if fmt == "wav" and self.model in {"bulbul:v3", "bulbul:v4-flash"}:
             received_sampling_rate = int.from_bytes(audio[24:28], byteorder="little")
             if self.original_sampling_rate != received_sampling_rate:
                 logger.warning(
@@ -186,21 +186,28 @@ class SarvamSynthesizer(StreamSynthesizer):
     # ------------------------------------------------------------------
 
     def _config_message(self):
-        return {
+        payload = {
             "type": "config",
             "data": {
+                "model": self.model,
                 "target_language_code": self.language,
                 "speaker": self.voice_id,
-                "pitch": self.pitch,
                 "pace": self.pace,
-                "loudness": self.loudness,
-                "enable_preprocessing": self.enable_preprocessing,
+                "speech_sample_rate": self.sampling_rate,
                 "output_audio_codec": "wav",
                 "output_audio_bitrate": "32k",
                 "max_chunk_length": 250,
                 "min_buffer_size": self.buffer_size,
             },
         }
+
+        if self.model not in {"bulbul:v3", "bulbul:v4-flash"}:
+            payload["data"].update(
+                pitch=self.pitch,
+                loudness=self.loudness,
+                enable_preprocessing=self.enable_preprocessing,
+            )
+        return payload
 
     async def set_target_language(self, language):
         """Switch TTS output language on the live socket via a fresh config message (no reconnect)."""
@@ -279,7 +286,7 @@ class SarvamSynthesizer(StreamSynthesizer):
             "enable_preprocessing": self.enable_preprocessing,
             "model": self.model,
         }
-        if self.model == "bulbul:v3":
+        if self.model in {"bulbul:v3", "bulbul:v4-flash"}:
             payload.pop("pitch")
             payload.pop("loudness")
         return await self._send_payload(payload)

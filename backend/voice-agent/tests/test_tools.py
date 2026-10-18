@@ -67,7 +67,7 @@ class TestAgentConfig:
         tools_config = build_agent_config()["tasks"][0]["tools_config"]
         assert tools_config["transcriber"]["provider"] == "sarvam"
         assert tools_config["transcriber"]["model"] == "saaras:v3"
-        assert tools_config["synthesizer"]["provider_config"]["model"] == "bulbul:v3"
+        assert tools_config["synthesizer"]["provider_config"]["model"] == "bulbul:v4-flash"
         assert tools_config["llm_agent"]["llm_config"]["provider"] == "openai"
 
     def test_stt_language_is_auto_detect(self):

@@ -27,6 +27,7 @@ exactly. Everything else on the class is ours.
 from __future__ import annotations
 
 import asyncio
+import re
 import base64
 import contextlib
 import json
@@ -34,6 +35,14 @@ import logging
 import time
 import uuid
 from typing import Any
+
+
+_TTS_EXPRESSION_CODE_RE = re.compile(r"(?<!\w)(?:LAUGH|WHISPER|SAD|HAPPY)(?=\s|$)\s*")
+
+
+def _display_transcript(text: str) -> str:
+    """Remove Sarvam expression controls from the text mirrored to the UI."""
+    return _TTS_EXPRESSION_CODE_RE.sub("", text).strip()
 
 import numpy as np
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
@@ -302,7 +311,7 @@ class WebSocketTransport:
             self._turn_speaking = True
             await self.publish_data({"type": "agent_turn", "state": "start"})
 
-        text = (meta_info.get("text") or "").strip()
+        text = _display_transcript((meta_info.get("text") or "").strip())
         if text and text != self._last_transcript:
             self._last_transcript = text
             self._transcript_open = True

@@ -63,7 +63,7 @@ Browser ────────── WebSocket (JSON frames) ─────�
 lib/voice/audio.ts                        vox/input_handlers/default.py
   Microphone → AudioWorklet → Int16                           ▼
   Playback   ← scheduled on the audio clock                   ▼
-   ▲                              saaras:v3 + LID → gpt-4o-mini → bulbul:v3
+   ▲                              saaras:v3 + LID → gpt-4o-mini → bulbul:v4-flash
    │  audio  base64 PCM @22.05k                               ▼
    │  mark   before and after each chunk    vox/output_handlers/default.py
    │  clear  barge-in: drop what is queued                     │
@@ -123,7 +123,7 @@ Redis isn't needed — it appears nowhere under `vox/`, only in the upstream
 
 Vox's Sarvam integration is already correct for this stack: `saaras:v3` with
 `mode=transcribe` (`sarvam_transcriber.py:133`), language auto-detect via
-`lid/sarvam.py`, and `bulbul:v3` WebSocket streaming. Its turn-taking also has
+`lid/sarvam.py`, and `bulbul:v4-flash` WebSocket streaming. Its turn-taking also has
 eager end-of-turn with speculative LLM generation (`task_manager.py:4688`),
 which is what removes dead air between turns.
 
