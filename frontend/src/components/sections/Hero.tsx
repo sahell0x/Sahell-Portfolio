@@ -6,6 +6,7 @@ import { experience, profile, socials } from "@/content";
 import { useTerminal } from "@/components/terminal/terminal-store";
 import {
   GithubIcon,
+  HuggingFaceIcon,
   LeetCodeIcon,
   LinkedinIcon,
 } from "@/components/ui/BrandIcons";
@@ -28,6 +29,7 @@ const socialIcon: Record<string, React.ElementType> = {
   github: GithubIcon,
   linkedin: LinkedinIcon,
   leetcode: LeetCodeIcon,
+  huggingface: HuggingFaceIcon,
   email: Mail,
 };
 

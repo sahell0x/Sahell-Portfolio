@@ -21,7 +21,7 @@ function usedIn(skill: string): string[] {
   const matches = (item: string) => {
     const n = norm(item);
     return keys.some(
-      (k) => k === n || (k.length > 3 && n.length > 3 && (n.includes(k) || k.includes(n)))
+      (k) => k === n || (k.length >= 2 && n.length >= 2 && (n.includes(k) || k.includes(n)))
     );
   };
 

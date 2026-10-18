@@ -50,6 +50,28 @@ export function About() {
           </p>
         </Rail>
       </Reveal>
+
+      {profile.achievements && profile.achievements.length > 0 && (
+        <Reveal delay={0.08} className="mt-12 border-t border-edge pt-8">
+          <Rail
+            aside={
+              <p className="font-display text-lg font-semibold tracking-tight text-ink">Achievements</p>
+            }
+          >
+            <ul className="space-y-3">
+              {profile.achievements.map((item, i) => (
+                <li
+                  key={i}
+                  className="flex max-w-[40rem] gap-3.5 text-[0.9375rem] leading-relaxed text-dim"
+                >
+                  <span className="mt-[0.7rem] h-px w-3 shrink-0 bg-edge-strong" />
+                  <span>{item}</span>
+                </li>
+              ))}
+            </ul>
+          </Rail>
+        </Reveal>
+      )}
     </Section>
   );
 }

@@ -48,6 +48,11 @@ def build_core_facts() -> str:
         "Projects:",
         *(f"  - {p.get('name', '')}: {p.get('tagline', '')}" for p in data["projects"]),
         "Skill areas: " + ", ".join(g.get("label", "") for g in data["skillGroups"]),
+        *(
+            ["Achievements:"] + [f"  - {a}" for a in profile.get("achievements", [])]
+            if profile.get("achievements")
+            else []
+        ),
     ]
     return "\n".join(line for line in lines if line.strip())
 

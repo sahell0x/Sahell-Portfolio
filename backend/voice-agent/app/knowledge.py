@@ -86,7 +86,8 @@ def _lines(*parts: str | None) -> str:
 def _profile_chunks(profile: dict[str, Any]) -> list[Chunk]:
     education = profile.get("education", {}) or {}
     stats = profile.get("stats", []) or []
-    return [
+    achievements = profile.get("achievements", []) or []
+    chunks = [
         Chunk(
             "profile:about",
             "About Sahil",
@@ -110,6 +111,15 @@ def _profile_chunks(profile: dict[str, Any]) -> list[Chunk]:
             "\n".join(f"- {s.get('value', '')}: {s.get('label', '')}" for s in stats),
         ),
     ]
+    if achievements:
+        chunks.append(
+            Chunk(
+                "profile:achievements",
+                "Achievements and Open Source",
+                "\n".join(f"- {a}" for a in achievements),
+            )
+        )
+    return chunks
 
 
 def _contact_chunk(profile: dict[str, Any], socials: list[dict[str, Any]]) -> Chunk:
@@ -127,12 +137,14 @@ def _contact_chunk(profile: dict[str, Any], socials: list[dict[str, Any]]) -> Ch
 
 def _job_chunk(job: dict[str, Any]) -> Chunk:
     current = " (current role)" if job.get("current") else ""
+    location = f" in {job.get('location')}" if job.get("location") else ""
+    link = f" Project/Website: {job.get('link')}" if job.get("link") else ""
     stack = job.get("stack", []) or []
     return Chunk(
         f"job:{job.get('company', '')}",
         f"Experience: {job.get('role', '')} at {job.get('company', '')}",
         _lines(
-            f"{job.get('role', '')} at {job.get('company', '')}, {job.get('period', '')}{current}.",
+            f"{job.get('role', '')} at {job.get('company', '')}{location}, {job.get('period', '')}{current}.{link}",
             job.get("summary"),
             *(f"- {h}" for h in job.get("highlights", []) or []),
             f"Stack: {', '.join(stack)}" if stack else None,

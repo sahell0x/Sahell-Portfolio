@@ -365,6 +365,19 @@ class TestPerDeviceWindows:
         assert decision.reason == LimitReason.DEVICE_DAILY
         assert decision.retry_after > HOUR
 
+    def test_spent_budget_outranks_cooldown_and_says_out_of_limit(self):
+        """Even within cooldown period, an exhausted budget takes precedence."""
+        limiter = device_limiter(per_device_hour=1, per_device_day=5, cooldown_seconds=30)
+        limiter.start_session("1.1.1.1", "s1", device_id=DEVICE_A, now=100.0)
+        limiter.end_session("s1", now=105.0)
+
+        # Checking at 110.0 (within the 30s cooldown, but 1 of 1 session is spent)
+        decision = limiter.check_session("1.1.1.1", device_id=DEVICE_A, now=110.0)
+        assert not decision.allowed
+        assert decision.reason == LimitReason.DEVICE_HOURLY
+        assert decision.message == "You have used all your uses, you are out of limit."
+
+
     def test_clearing_site_data_still_hits_the_ip_ceiling(self):
         """The device id is spoofable; the IP cap is what actually holds."""
         limiter = device_limiter(per_ip_hour=3, per_device_hour=1, cooldown_seconds=0)

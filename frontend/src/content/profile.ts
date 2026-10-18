@@ -24,6 +24,7 @@ export interface Profile {
   resumeUrl: string;
   education: Education;
   stats: Stat[];
+  achievements: string[];
 }
 
 export const profile: Profile = {
@@ -49,7 +50,7 @@ export const profile: Profile = {
   resumeUrl: "https://resume.sahell.in",
   education: {
     school: "Jawaharlal Institute of Technology, Vidhya Vihar, Borawan",
-    degree: "B.E. in Electronics & Communication Engineering",
+    degree: "B.E. in Electronics and Communication Engineering (ECE)",
     period: "Graduated 2025",
     cgpa: "7.34 / 10",
   },
@@ -58,5 +59,11 @@ export const profile: Profile = {
     { value: "40%", label: "LLM inference cost cut with vLLM" },
     { value: "60%+", label: "increase in concurrent active calls" },
     { value: "100k+", label: "document chunks served in RAG" },
+    { value: "90%", label: "LLM dev & testing cost cut on on-prem 8x V100 GPU server" },
+    { value: "1,200+", label: "Hugging Face downloads for open-source Bash LLM" },
+  ],
+  achievements: [
+    "Fine-tuned and open-sourced a sub-second 0.5B parameter Bash LLM, selected for the Featherless.ai cloud inference catalog and downloaded over 1,200 times on Hugging Face.",
+    "Open-source contributor to Bruno and Rocket.Chat (Google Summer of Code / GSoC 2025).",
   ],
 };

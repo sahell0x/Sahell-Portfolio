@@ -26,6 +26,12 @@ export const socials: Social[] = [
     cmd: "leetcode",
   },
   {
+    name: "Hugging Face",
+    handle: "sahellx",
+    url: "https://huggingface.co/sahellx",
+    cmd: "huggingface",
+  },
+  {
     name: "Email",
     handle: "s.sahil9752@gmail.com",
     url: "mailto:s.sahil9752@gmail.com",

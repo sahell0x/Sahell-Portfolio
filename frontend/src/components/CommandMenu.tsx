@@ -29,6 +29,7 @@ import { useTerminal } from "@/components/terminal/terminal-store";
 import { getTheme, setTheme } from "@/lib/theme";
 import {
   GithubIcon,
+  HuggingFaceIcon,
   LeetCodeIcon,
   LinkedinIcon,
 } from "@/components/ui/BrandIcons";
@@ -98,9 +99,10 @@ export function CommandMenu() {
       github: <GithubIcon className={iconClass} />,
       linkedin: <LinkedinIcon className={iconClass} />,
       leetcode: <LeetCodeIcon className={iconClass} />,
+      huggingface: <HuggingFaceIcon className={iconClass} />,
     };
     return [
-      { id: "about", group: "Go to", label: "About", icon: <User className={iconClass} />, run: () => scrollToId("about") },
+      { id: "about", group: "Go to", label: "About", icon: <User className={iconClass} />, keywords: "bio education achievements awards", run: () => scrollToId("about") },
       { id: "experience", group: "Go to", label: "Experience", icon: <Briefcase className={iconClass} />, keywords: "work jobs career", run: () => scrollToId("experience") },
       { id: "skills", group: "Go to", label: "Stack", icon: <Layers className={iconClass} />, keywords: "skills tech tools", run: () => scrollToId("skills") },
       { id: "projects", group: "Go to", label: "Projects", icon: <FolderGit2 className={iconClass} />, run: () => scrollToId("projects") },

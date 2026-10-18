@@ -232,13 +232,33 @@ export function VoiceAssistant() {
     (status === "idle" || status === "rate-limited");
   const micDenied = status === "mic-denied";
 
+  const isOutOfQuota =
+    quota !== null &&
+    !quota.active_elsewhere &&
+    (quota.remaining_hour <= 0 || quota.remaining_day <= 0) &&
+    status !== "ended";
+
   // Every "you can't start right now" collapses to one sentence and, when
   // there is a wait worth naming, a countdown that actually counts.
   const notice: { text: string; wait: number | null } | null = elsewhere
     ? { text: ELSEWHERE_NOTE, wait: null }
-    : status === "rate-limited"
-      ? { text: errorMessage ?? UNAVAILABLE_NOTE, wait: retryAfter }
-      : null;
+    : isOutOfQuota
+      ? {
+          text: "You have used all your uses, you are out of limit.",
+          wait: Math.max(quota?.resets_in ?? 0, retryAfter),
+        }
+      : status === "rate-limited"
+        ? {
+            text:
+              errorMessage && !errorMessage.includes("Just a moment")
+                ? errorMessage
+                : (retryAfter > 60 ||
+                   (quota !== null && (quota.remaining_hour <= 0 || quota.remaining_day <= 0))
+                    ? "You have used all your uses, you are out of limit."
+                    : (errorMessage ?? UNAVAILABLE_NOTE)),
+            wait: retryAfter,
+          }
+        : null;
   const refused = notice !== null;
 
   useEffect(() => {

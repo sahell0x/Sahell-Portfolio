@@ -66,6 +66,11 @@ export const projects: Project[] = [
         detail:
           "An eval suite of seeded bugs, reversed CVE fixes and clean PRs scores precision, recall and cost per PR, with ablations that switch stages off.",
       },
+      {
+        title: "AWS Cloud deployment",
+        detail:
+          "Deployed on AWS EC2 (small instance) with AWS RDS for PostgreSQL and pgvector.",
+      },
     ],
     stack: [
       "Python",
@@ -82,6 +87,8 @@ export const projects: Project[] = [
       "MCP",
       "Next.js",
       "TypeScript",
+      "AWS EC2",
+      "AWS RDS",
       "Razorpay",
     ],
     tags: ["AI Agents", "DevTools", "Security"],
@@ -134,6 +141,11 @@ export const projects: Project[] = [
           "Server-sent events stream each node as it finishes; the trace tab shows tokens, cost and citation rate for every run.",
       },
       {
+        title: "AWS Cloud deployment",
+        detail:
+          "Deployed on AWS EC2 (small instance) with AWS RDS for PostgreSQL and pgvector.",
+      },
+      {
         title: "A complete product",
         detail:
           "Accounts with Google sign-in, compare, watchlist, PDF export, public share links, credits via Razorpay (test mode), quotas and a daily LLM budget guard.",
@@ -152,6 +164,8 @@ export const projects: Project[] = [
       "OpenAI API",
       "Next.js",
       "TypeScript",
+      "AWS EC2",
+      "AWS RDS",
       "Razorpay",
     ],
     tags: ["RAG", "Agents", "Finance"],

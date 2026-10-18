@@ -277,6 +277,48 @@ class RateLimiter:
                 message="There are already voice sessions running on this network.",
             )
 
+        # Budgets are tested before the cooldown: an exhausted budget is the
+        # real obstacle. Naming the cooldown when the hour or day is spent
+        # promises a slot after a few seconds that the budget will refuse again.
+        # Within budgets, day is tested before hour because an exhausted day
+        # makes the hourly wait a lie.
+        if device_id is not None:
+            device_daily = self._window(self._device_daily, device_id, DAY)
+            if device_daily.count(now) >= self.per_device_day:
+                return LimitDecision(
+                    False,
+                    LimitReason.DEVICE_DAILY,
+                    retry_after=device_daily.retry_after(now),
+                    message="You have used all your uses, you are out of limit.",
+                )
+
+            device_hourly = self._window(self._device_hourly, device_id, HOUR)
+            if device_hourly.count(now) >= self.per_device_hour:
+                return LimitDecision(
+                    False,
+                    LimitReason.DEVICE_HOURLY,
+                    retry_after=device_hourly.retry_after(now),
+                    message="You have used all your uses, you are out of limit.",
+                )
+
+        daily = self._window(self._daily, ip, DAY)
+        if daily.count(now) >= self.per_ip_day:
+            return LimitDecision(
+                False,
+                LimitReason.IP_DAILY,
+                retry_after=daily.retry_after(now),
+                message="You have used all your uses, you are out of limit.",
+            )
+
+        hourly = self._window(self._hourly, ip, HOUR)
+        if hourly.count(now) >= self.per_ip_hour:
+            return LimitDecision(
+                False,
+                LimitReason.IP_HOURLY,
+                retry_after=hourly.retry_after(now),
+                message="You have used all your uses, you are out of limit.",
+            )
+
         if device_id is not None:
             cooldown = self._cooldown_left(device_id, now)
             if cooldown:
@@ -286,48 +328,6 @@ class RateLimiter:
                     retry_after=cooldown,
                     message="Just a moment before you start another call.",
                 )
-
-            # The day is tested before the hour, against the general rule of
-            # naming the shortest wait first. When both windows are full the
-            # hourly message is simply false: it promises a slot in an hour
-            # that the daily cap will refuse again. The hourly branch below
-            # still fires on its own, with its own shorter wait, whenever the
-            # day has room left.
-            device_daily = self._window(self._device_daily, device_id, DAY)
-            if device_daily.count(now) >= self.per_device_day:
-                return LimitDecision(
-                    False,
-                    LimitReason.DEVICE_DAILY,
-                    retry_after=device_daily.retry_after(now),
-                    message="You've used your voice sessions for today.",
-                )
-
-            device_hourly = self._window(self._device_hourly, device_id, HOUR)
-            if device_hourly.count(now) >= self.per_device_hour:
-                return LimitDecision(
-                    False,
-                    LimitReason.DEVICE_HOURLY,
-                    retry_after=device_hourly.retry_after(now),
-                    message="You've used your voice sessions for this hour.",
-                )
-
-        daily = self._window(self._daily, ip, DAY)
-        if daily.count(now) >= self.per_ip_day:
-            return LimitDecision(
-                False,
-                LimitReason.IP_DAILY,
-                retry_after=daily.retry_after(now),
-                message="You've used your voice sessions for today.",
-            )
-
-        hourly = self._window(self._hourly, ip, HOUR)
-        if hourly.count(now) >= self.per_ip_hour:
-            return LimitDecision(
-                False,
-                LimitReason.IP_HOURLY,
-                retry_after=hourly.retry_after(now),
-                message="You've used your voice sessions for this hour.",
-            )
 
         return LimitDecision(True)
 

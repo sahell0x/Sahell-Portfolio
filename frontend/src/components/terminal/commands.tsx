@@ -142,6 +142,18 @@ const commands: Command[] = [
           {profile.education.degree}, {profile.education.school} (
           {profile.education.period}, CGPA {profile.education.cgpa}).
         </p>
+        {profile.achievements && profile.achievements.length > 0 && (
+          <div className="pt-1 text-faint">
+            <span className="text-ink">achievements</span>
+            <ul className="mt-1 space-y-1 text-dim">
+              {profile.achievements.map((a, i) => (
+                <li key={i}>
+                  <span className="text-dim">›</span> {a}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
       </div>
     ),
   },
@@ -153,7 +165,11 @@ const commands: Command[] = [
       const filter = args[0]?.toLowerCase();
       const groups = filter
         ? skillGroups.filter(
-            (g) => g.key === filter || g.label.toLowerCase().includes(filter)
+            (g) =>
+              g.key === filter ||
+              g.label.toLowerCase().includes(filter) ||
+              (filter === "tech" && g.key === "tools") ||
+              (filter === "lang" && g.key === "languages")
           )
         : skillGroups;
       if (groups.length === 0) {
@@ -168,7 +184,7 @@ const commands: Command[] = [
           {groups.map((g) => (
             <div key={g.key}>
               <span className="text-ink">
-                {g.label.padEnd(14, " ")}
+                {g.label.padEnd(24, " ")}
               </span>
               <span className="text-dim">{g.items.join(" · ")}</span>
             </div>
@@ -225,10 +241,34 @@ const commands: Command[] = [
     ),
   },
   {
+    name: "achievements",
+    aliases: ["awards", "honors", "gsoc"],
+    description: "open source achievements & recognitions",
+    run: () => (
+      <div className="space-y-2">
+        <p className="text-ink">Achievements & Open Source Recognitions:</p>
+        <ul className="space-y-1 text-dim">
+          {(profile.achievements ?? []).map((a, i) => (
+            <li key={i}>
+              <span className="text-dim">›</span> {a}
+            </li>
+          ))}
+        </ul>
+      </div>
+    ),
+  },
+  {
     name: "ls",
     description: "list directories — ls, ls skills, ls projects…",
     run: (args, ctx) => {
-      const dirs = ["about", "experience", "skills", "projects", "contact"];
+      const dirs = [
+        "about",
+        "experience",
+        "skills",
+        "projects",
+        "achievements",
+        "contact",
+      ];
       const dir = (args[0] ?? "").toLowerCase().replace(/\/+$/, "");
       if (!dir || dir === "~" || dir === "." || dir === "/") {
         return (
@@ -406,6 +446,16 @@ const commands: Command[] = [
     run: (_a, ctx) => {
       ctx.openUrl("https://leetcode.com/Sahell");
       return <p className="text-dim">opening leetcode.com/Sahell…</p>;
+    },
+  },
+  {
+    name: "huggingface",
+    aliases: ["hf"],
+    hidden: true,
+    description: "open Hugging Face",
+    run: (_a, ctx) => {
+      ctx.openUrl("https://huggingface.co/sahellx");
+      return <p className="text-dim">opening huggingface.co/sahellx…</p>;
     },
   },
   {
@@ -668,7 +718,14 @@ function argOptionsFor(cmdName: string): string[] {
   if (c === "cd")
     return ["about", "skills", "experience", "projects", "contact", "~"];
   if (c === "ls")
-    return ["about", "experience", "skills", "projects", "contact"];
+    return [
+      "about",
+      "experience",
+      "skills",
+      "projects",
+      "achievements",
+      "contact",
+    ];
   if (["skills", "stack"].includes(c)) return skillGroups.map((g) => g.key);
   return [];
 }

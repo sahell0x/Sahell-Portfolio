@@ -61,13 +61,13 @@ check(
 check(
   "an exhausted hour names when it comes back",
   describeQuota({ ...healthy, remaining_hour: 0, resets_in: 600 }, 0)?.text,
-  "You've used your sessions for this hour — more in 10m.",
+  "You have used all your uses, you are out of limit.",
 );
 
 check(
   "an exhausted day says so and offers nothing it cannot deliver",
   describeQuota({ ...healthy, remaining_hour: 0, remaining_day: 0 }, 0)?.text,
-  "You've used your voice sessions for today.",
+  "You have used all your uses, you are out of limit.",
 );
 
 check("a healthy budget is not a blocker", describeQuota(healthy, 0), {

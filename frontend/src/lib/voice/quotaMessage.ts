@@ -58,13 +58,9 @@ export function describeQuota(
     return { text: `You can start again in ${formatWait(cooldown)}.`, blocking: true };
   }
 
-  if (quota.remaining_hour <= 0) {
-    const wait = Math.max(quota.resets_in, retryAfter);
+  if (quota.remaining_hour <= 0 || quota.remaining_day <= 0) {
     return {
-      text:
-        quota.remaining_day <= 0
-          ? "You've used your voice sessions for today."
-          : `You've used your sessions for this hour — more in ${formatWait(wait)}.`,
+      text: "You have used all your uses, you are out of limit.",
       blocking: true,
     };
   }

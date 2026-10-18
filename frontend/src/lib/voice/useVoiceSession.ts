@@ -265,18 +265,26 @@ export function useVoiceSession(onAction: PageActionRunner) {
 
   const applyLimits = useCallback((body: LimitsResponse | null) => {
     if (!body) return;
-    setState((prev) => ({
-      ...prev,
-      quota: body,
-      sessionSeconds: body.session_seconds,
-      retryAfter: body.cooldown_remaining || body.resets_in,
-      // A refusal that no longer applies — the other tab closed, the hour
-      // rolled over — has to release the UI, or the visitor is left staring at
-      // a reason that stopped being true.
-      ...(prev.status === "rate-limited" && body.allowed
-        ? { status: "idle" as VoiceStatus, errorMessage: null }
-        : null),
-    }));
+    setState((prev) => {
+      const isOutOfQuota = body.remaining_hour <= 0 || body.remaining_day <= 0;
+      let nextError = prev.errorMessage;
+      if (prev.status === "rate-limited" && isOutOfQuota) {
+        nextError = "You have used all your uses, you are out of limit.";
+      }
+      return {
+        ...prev,
+        quota: body,
+        sessionSeconds: body.session_seconds,
+        retryAfter: body.cooldown_remaining || body.resets_in,
+        errorMessage: nextError,
+        // A refusal that no longer applies — the other tab closed, the hour
+        // rolled over — has to release the UI, or the visitor is left staring at
+        // a reason that stopped being true.
+        ...(prev.status === "rate-limited" && body.allowed
+          ? { status: "idle" as VoiceStatus, errorMessage: null }
+          : null),
+      };
+    });
   }, []);
 
   const refreshLimits = useCallback(
@@ -430,6 +438,19 @@ export function useVoiceSession(onAction: PageActionRunner) {
   const start = useCallback(async () => {
     if (socketRef.current) return;
 
+    if (
+      state.quota &&
+      !state.quota.active_elsewhere &&
+      (state.quota.remaining_hour <= 0 || state.quota.remaining_day <= 0)
+    ) {
+      patch({
+        status: "rate-limited",
+        errorMessage: "You have used all your uses, you are out of limit.",
+        retryAfter: state.quota.resets_in,
+      });
+      return;
+    }
+
     patch({ status: "requesting-mic", errorMessage: null, isEnding: false, transcript: [] });
 
     // Ask for the microphone before creating a session, so a denied permission
@@ -476,9 +497,15 @@ export function useVoiceSession(onAction: PageActionRunner) {
           message: "Could not start the assistant.",
         }));
         stream.getTracks().forEach((track) => track.stop());
+        const isOutOfQuota =
+          Boolean(body.quota && (body.quota.remaining_hour <= 0 || body.quota.remaining_day <= 0)) ||
+          body.error?.includes("hourly") ||
+          body.error?.includes("daily");
         patch({
           status: response.status === 429 ? "rate-limited" : "error",
-          errorMessage: body.message,
+          errorMessage: isOutOfQuota
+            ? "You have used all your uses, you are out of limit."
+            : body.message,
           quota: body.quota ?? null,
           retryAfter: body.retry_after ?? 0,
         });
@@ -567,7 +594,7 @@ export function useVoiceSession(onAction: PageActionRunner) {
         return { ...prev, secondsLeft: next, isEnding: next <= 30 };
       });
     }, 1000);
-  }, [handleFrame, patch, send, startMeter, stop, teardown]);
+  }, [handleFrame, patch, send, startMeter, state.quota, stop, teardown]);
 
   /**
    * Put a typed question to Kaira. Mid-call it is sent at once; before the
