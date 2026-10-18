@@ -27,7 +27,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { Microphone, Playback, decodePcm, encodeBase64 } from "./audio";
 import { resetVoiceBus, writeVoiceBus } from "./bus";
-import { deviceHeaders } from "./deviceId";
+import { deviceHeaders, getDeviceHeaders } from "./deviceId";
 import {
   type ClientMessage,
   type LimitsResponse,
@@ -99,7 +99,8 @@ function releaseSession(sessionId: string): void {
  */
 async function fetchLimits(): Promise<LimitsResponse | null> {
   try {
-    const response = await fetch(`${API_BASE}/limits`, { headers: deviceHeaders() });
+    const headers = await getDeviceHeaders();
+    const response = await fetch(`${API_BASE}/limits`, { headers });
     return response.ok ? ((await response.json()) as LimitsResponse) : null;
   } catch {
     return null;
@@ -464,9 +465,10 @@ export function useVoiceSession(onAction: PageActionRunner) {
 
     let credentials: SessionCredentials;
     try {
+      const headers = await getDeviceHeaders();
       const response = await fetch(`${API_BASE}/session`, {
         method: "POST",
-        headers: deviceHeaders(),
+        headers,
       });
       if (!response.ok) {
         const body: SessionError = await response.json().catch(() => ({

@@ -10,6 +10,7 @@
     "test:voice": "tsc --outDir .voice-checks --rootDir src/lib/voice --module commonjs --target es2020 --moduleResolution node --skipLibCheck src/lib/voice/__checks__/quotaMessage.check.ts && node .voice-checks/__checks__/quotaMessage.check.js"
   },
   "dependencies": {
+    "@fingerprintjs/fingerprintjs": "^5.3.0",
     "@vercel/analytics": "^2.0.1",
     "geist": "^1.7.2",
     "lucide-react": "^1.26.0",
