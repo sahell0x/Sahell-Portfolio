@@ -97,6 +97,7 @@ def build_agent_config() -> dict[str, Any]:
             "model": settings.llm_model,
             "temperature": settings.llm_temperature,
             "max_tokens": settings.llm_max_tokens,
+            "reasoning_effort": "none",
             "request_json": False,
         },
     }
