@@ -35,6 +35,7 @@ SONIOX_AUTO_LANGUAGE_VALUES = {"", "multi", "auto", "multilingual", "unknown"}
 
 # Model prefixes
 GPT5_MODEL_PREFIX = "gpt-5"
+GPT6_MODEL_PREFIX = "gpt-6"
 GPT5_4_MODEL_PREFIX = "gpt-5.4"
 GPT5_5_MODEL_PREFIX = "gpt-5.5"
 GPT5_6_MODEL_PREFIX = "gpt-5.6"
